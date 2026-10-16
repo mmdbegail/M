@@ -1,313 +1,533 @@
-const HTML = String.raw`
-
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#0b0915">
-<title>Identity | Telegram</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{color-scheme:dark;--purple:#a78bfa;--muted:#9994ad;--border:rgba(255,255,255,.09)}
-body{min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Tahoma,sans-serif;background:radial-gradient(ellipse at 90% 0%,rgba(126,87,255,.19),transparent 45%),radial-gradient(ellipse at 0% 100%,rgba(80,65,200,.13),transparent 40%),#0b0915;color:white;padding:25px 18px}
-.container{max-width:440px;margin:auto}
-.header{display:flex;justify-content:space-between;align-items:center;margin:12px 0 30px}
-.brand{font-size:15px;font-weight:800}
-.badge{font-size:10px;color:#c4b5fd;background:rgba(167,139,250,.12);border:1px solid rgba(167,139,250,.2);padding:7px 10px;border-radius:30px}
-.profile{text-align:center;padding:27px 20px 24px;border:1px solid var(--border);background:linear-gradient(145deg,rgba(255,255,255,.075),rgba(255,255,255,.025));border-radius:25px;backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);box-shadow:0 20px 70px rgba(0,0,0,.18)}
-.avatar{width:94px;height:94px;border-radius:30px;margin:0 auto 18px;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#8b5cf6,#4f46e5);border:1px solid rgba(255,255,255,.2);box-shadow:0 10px 35px rgba(124,58,237,.28);font-size:35px;font-weight:800;overflow:hidden}
-.avatar img{width:100%;height:100%;object-fit:cover}
-.name{font-size:23px;font-weight:800;overflow-wrap:anywhere}
-.username{font-size:13px;color:var(--muted);margin-top:8px}
-.status{display:inline-flex;align-items:center;gap:7px;margin-top:17px;padding:7px 11px;border-radius:30px;font-size:11px;color:#86efac;background:rgba(34,197,94,.09);border:1px solid rgba(34,197,94,.16)}
-.dot{width:6px;height:6px;border-radius:50%;background:#4ade80}
-.section-title{margin:27px 2px 13px;font-size:12px;font-weight:700;color:var(--muted)}
-.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:11px}
-.info{padding:17px 15px;background:rgba(255,255,255,.055);border:1px solid var(--border);border-radius:17px;min-width:0}
-.label{font-size:11px;color:var(--muted);margin-bottom:11px}
-.value{font-size:14px;font-weight:700;overflow-wrap:anywhere}
-.id-card{margin-top:11px;padding:17px;background:rgba(255,255,255,.055);border:1px solid var(--border);border-radius:17px;display:flex;justify-content:space-between;align-items:center;gap:12px}
-.id-number{font-size:17px;font-weight:800;direction:ltr;overflow-wrap:anywhere}
-button{font-family:inherit;cursor:pointer}
-.copy{flex-shrink:0;border:1px solid rgba(167,139,250,.2);background:rgba(167,139,250,.12);color:#c4b5fd;border-radius:10px;padding:10px 13px;font-size:11px}
-.note{margin-top:20px;padding:14px;border:1px solid var(--border);border-radius:14px;color:var(--muted);font-size:11px;line-height:2}
-.footer{text-align:center;color:#625d76;font-size:10px;margin:24px 0 10px}
-#error{margin-top:30px;text-align:center;padding:22px;color:#fca5a5;line-height:2;background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:16px;overflow-wrap:anywhere}
-.hidden{display:none!important}
-@media(max-width:350px){body{padding:16px 12px}.info-grid{gap:8px}.info{padding:13px 11px}}
-</style>
-</head>
-<body>
-<div class="container">
-<header class="header">
-<div class="brand">IDENTITY<span style="color:#a78bfa">.</span></div>
-<div class="badge">TELEGRAM MINI APP</div>
-</header>
-<main id="app" class="hidden">
-<section class="profile">
-<div class="avatar" id="avatar">?</div>
-<div class="name" id="name">—</div>
-<div class="username" id="username">—</div>
-<div class="status"><span class="dot"></span> اطلاعات حساب تأیید شد</div>
-</section>
-<div class="section-title">اطلاعات حساب</div>
-<section class="info-grid">
-<div class="info"><div class="label">نام</div><div class="value" id="firstName">—</div></div>
-<div class="info"><div class="label">نام خانوادگی</div><div class="value" id="lastName">—</div></div>
-<div class="info"><div class="label">زبان تلگرام</div><div class="value" id="language">—</div></div>
-<div class="info"><div class="label">تلگرام پریمیوم</div><div class="value" id="premium">—</div></div>
-<div class="info"><div class="label">پلتفرم</div><div class="value" id="platform">—</div></div>
-<div class="info"><div class="label">نسخه WebApp</div><div class="value" id="version">—</div></div>
-</section>
-<div class="section-title">شناسه کاربری</div>
-<section class="id-card">
-<div style="min-width:0"><div class="label">Telegram User ID</div><div class="id-number" id="userId">—</div></div>
-<button class="copy" id="copyButton">کپی شناسه</button>
-</section>
-<div class="note">اطلاعات کاربر پس از تأیید امضای داده‌های تلگرام در سمت سرور نمایش داده می‌شود. این برنامه شماره تلفن یا رمز عبور شما را دریافت نمی‌کند.</div>
-</main>
-<div id="error" class="hidden"></div>
-<footer class="footer">IDENTITY SYSTEM · CLOUDFLARE WORKERS</footer>
-</div>
-<script>
-(async function(){
-  const tg = window.Telegram && window.Telegram.WebApp;
-  const app = document.getElementById('app');
-  const errorBox = document.getElementById('error');
-
-function fail(message){
-errorBox.textContent = message;
-errorBox.classList.remove(‘hidden’);
-}
-
-function set(id,value){
-document.getElementById(id).textContent =
-value === undefined || value === null || value === ‘’ ? ‘—’ : String(value);
-}
-
-if(!tg){
-fail(‘Telegram WebApp SDK بارگذاری نشد. اتصال اینترنت را بررسی کن.’);
-return;
-}
-
-tg.ready();
-tg.expand();
-
-const initData = tg.initData || ‘’;
-
-if(!initData){
-fail(‘تلگرام داده احراز هویت ارسال نکرده است. مینی‌اپ را از داخل تلگرام باز کن.’);
-return;
-}
-
-try{
-const response = await fetch(’/api/auth’, {
-method: ‘POST’,
-headers: {‘Content-Type’:‘application/json’},
-body: JSON.stringify({initData})
-});
-
-const result = await response.json();
-if(!response.ok || !result.ok || !result.user){
-  fail(result.error || 'اعتبارسنجی اطلاعات کاربر ناموفق بود.');
-  return;
-}
-const user = result.user;
-const fullName = [user.first_name,user.last_name].filter(Boolean).join(' ');
-set('name',fullName || 'Telegram User');
-set('username',user.username ? '@'+user.username : 'یوزرنیم تنظیم نشده');
-set('firstName',user.first_name);
-set('lastName',user.last_name);
-set('language',user.language_code);
-set('premium',user.is_premium ? 'فعال ✓' : 'فعال نیست');
-set('platform',tg.platform);
-set('version',tg.version);
-set('userId',user.id);
-const avatar = document.getElementById('avatar');
-avatar.textContent = (user.first_name || '?').charAt(0).toUpperCase();
-if(user.photo_url){
-  const img = new Image();
-  img.alt = 'Profile';
-  img.referrerPolicy = 'no-referrer';
-  img.onload = ()=>{avatar.textContent='';avatar.appendChild(img)};
-  img.src = user.photo_url;
-}
-document.getElementById('copyButton').addEventListener('click',async function(){
-  try{
-    await navigator.clipboard.writeText(String(user.id));
-    this.textContent = 'کپی شد ✓';
-  }catch(e){
-    this.textContent = String(user.id);
-  }
-  const button=this;
-  setTimeout(()=>button.textContent='کپی شناسه',1800);
-});
-app.classList.remove('hidden');
-
-}catch(e){
-fail(‘ارتباط با سرور برقرار نشد. صفحه را دوباره باز کن.’);
-}
-})();
-</body>
-</html>`;
-
-async function validateTelegramInitData(initData, botToken) {
-if (typeof initData !== “string” || !initData || initData.length > 16384) {
-return null;
-}
-
-const params = new URLSearchParams(initData);
-const receivedHash = params.get(“hash”);
-
-if (!receivedHash || !/^[a-f0-9]{64}$/i.test(receivedHash)) {
-return null;
-}
-
-// Reject duplicate security-critical fields.
-if (params.getAll(“hash”).length !== 1 ||
-params.getAll(“auth_date”).length !== 1 ||
-params.getAll(“user”).length !== 1) {
-return null;
-}
-
-const authDate = Number(params.get(“auth_date”));
-const now = Math.floor(Date.now() / 1000);
-
-// Only accept recently issued authentication data.
-if (!Number.isSafeInteger(authDate) || authDate > now + 30 || now - authDate > 3600) {
-return null;
-}
-
-const entries = [];
-for (const [key, value] of params.entries()) {
-if (key !== “hash”) entries.push([key, value]);
-}
-
-entries.sort(([a], [b]) => a.localeCompare(b));
-
-const dataCheckString = entries
-.map(([key, value]) => ${key}=${value})
-.join(”\n”);
-
+const MAX_BODY_SIZE = 16_384;
+const MAX_AUTH_AGE = 60 * 60;
 const encoder = new TextEncoder();
-
-// Telegram Mini Apps: secret_key = HMAC_SHA256(key=“WebAppData”, message=bot_token)
-const secretKey = await crypto.subtle.importKey(
-“raw”,
-encoder.encode(“WebAppData”),
-{ name: “HMAC”, hash: “SHA-256” },
-false,
-[“sign”]
-);
-
-const secret = await crypto.subtle.sign(
-“HMAC”,
-secretKey,
-encoder.encode(botToken)
-);
-
-const hmacKey = await crypto.subtle.importKey(
-“raw”,
-secret,
-{ name: “HMAC”, hash: “SHA-256” },
-false,
-[“sign”]
-);
-
-const calculated = new Uint8Array(
-await crypto.subtle.sign(“HMAC”, hmacKey, encoder.encode(dataCheckString))
-);
-
-const expectedHash = Array.from(calculated)
-.map(byte => byte.toString(16).padStart(2, “0”))
-.join(””);
-
-// Constant-time comparison.
-let diff = 0;
-for (let i = 0; i < 64; i++) {
-diff |= expectedHash.charCodeAt(i) ^ receivedHash.toLowerCase().charCodeAt(i);
-}
-
-if (diff !== 0) return null;
-
-let user;
-try {
-user = JSON.parse(params.get(“user”));
-} catch {
-return null;
-}
-
-if (!user || !Number.isSafeInteger(user.id) || user.id <= 0) return null;
-
-// Return only the fields used by the UI.
-return {
-id: user.id,
-first_name: typeof user.first_name === “string” ? user.first_name : “”,
-last_name: typeof user.last_name === “string” ? user.last_name : “”,
-username: typeof user.username === “string” ? user.username : “”,
-language_code: typeof user.language_code === “string” ? user.language_code : “”,
-is_premium: user.is_premium === true,
-photo_url: typeof user.photo_url === “string” ? user.photo_url : “”
-};
-}
-
 export default {
-async fetch(request, env) {
-const url = new URL(request.url);
-
-if (url.pathname === "/api/auth") {
-  if (request.method !== "POST") {
-    return Response.json(
-      { ok: false, error: "Method Not Allowed" },
-      { status: 405, headers: { Allow: "POST" } }
-    );
-  }
-  if (!env.BOT_TOKEN) {
-    return Response.json(
-      { ok: false, error: "Secret با نام BOT_TOKEN در Cloudflare تنظیم نشده است." },
-      { status: 500 }
-    );
-  }
-  let body;
-  try {
-    if (Number(request.headers.get("content-length") || 0) > 20000) {
-      return Response.json({ ok: false, error: "درخواست بیش از حد بزرگ است." }, { status: 413 });
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(request),
+      });
     }
-    body = await request.json();
-  } catch {
-    return Response.json({ ok: false, error: "درخواست نامعتبر است." }, { status: 400 });
-  }
-  const user = await validateTelegramInitData(body?.initData, env.BOT_TOKEN);
-  if (!user) {
-    return Response.json(
-      { ok: false, error: "اعتبارسنجی اطلاعات تلگرام ناموفق بود. مینی‌اپ را دوباره باز کن." },
-      { status: 401 }
-    );
-  }
-  return Response.json(
-    { ok: true, user },
-    {
-      headers: {
-        "Cache-Control": "no-store",
-        "X-Content-Type-Options": "nosniff"
+    if (url.pathname === "/api/auth") {
+      if (request.method !== "POST") {
+        return json({ ok: false, error: "Method not allowed" }, 405);
+      }
+      if (!env.BOT_TOKEN) {
+        return json({ ok: false, error: "Server configuration error" }, 500);
+      }
+      const contentType = request.headers.get("content-type") || "";
+      if (!contentType.toLowerCase().includes("application/json")) {
+        return json({ ok: false, error: "Invalid content type" }, 415);
+      }
+      const declaredLength = Number(request.headers.get("content-length") || 0);
+      if (declaredLength > MAX_BODY_SIZE) {
+        return json({ ok: false, error: "Request too large" }, 413);
+      }
+      let body;
+      try {
+        const raw = await request.text();
+        if (encoder.encode(raw).length > MAX_BODY_SIZE) {
+          return json({ ok: false, error: "Request too large" }, 413);
+        }
+        body = JSON.parse(raw);
+      } catch {
+        return json({ ok: false, error: "Invalid JSON" }, 400);
+      }
+      if (!body || typeof body.initData !== "string" || !body.initData) {
+        return json({ ok: false, error: "Telegram initData is missing" }, 400);
+      }
+      try {
+        const user = await validateTelegramInitData(
+          body.initData,
+          env.BOT_TOKEN
+        );
+        return json({
+          ok: true,
+          user: {
+            id: user.id,
+            first_name: user.first_name || "",
+            last_name: user.last_name || "",
+            full_name: [user.first_name, user.last_name]
+              .filter(Boolean)
+              .join(" "),
+            username: user.username || null,
+            language_code: user.language_code || null,
+            is_premium: user.is_premium === true,
+            allows_write_to_pm: user.allows_write_to_pm === true,
+            photo_url: user.photo_url || null,
+          },
+        });
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Authentication failed";
+        const status =
+          message === "Expired initData" ||
+          message === "Invalid authentication data"
+            ? 401
+            : 400;
+        return json({ ok: false, error: message }, status);
       }
     }
-  );
-}
-if (url.pathname !== "/" || request.method !== "GET") {
-  return new Response("Not Found", { status: 404 });
-}
-return new Response(HTML, {
-  headers: {
-    "Content-Type": "text/html; charset=UTF-8",
-    "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
-    "Content-Security-Policy":
-      "default-src 'self'; script-src 'unsafe-inline' https://telegram.org; style-src 'unsafe-inline'; img-src https: data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors https://web.telegram.org https://*.telegram.org"
-  }
-});
-
-}
+    if (url.pathname === "/health") {
+      return json({ ok: true, service: "Telegram Mini App" });
+    }
+    if (url.pathname !== "/") {
+      return new Response("Not found", {
+        status: 404,
+        headers: securityHeaders(),
+      });
+    }
+    return new Response(HTML, {
+      headers: {
+        "content-type": "text/html; charset=UTF-8",
+        "cache-control": "no-store",
+        ...securityHeaders(),
+      },
+    });
+  },
 };
+async function validateTelegramInitData(initData, botToken) {
+  if (initData.length > 12_000) {
+    throw new Error("Authentication data too large");
+  }
+  const params = new URLSearchParams(initData);
+  const entries = [...params.entries()];
+  // Reject duplicate fields to avoid ambiguous validation.
+  const seen = new Set();
+  for (const [key] of entries) {
+    if (seen.has(key)) throw new Error("Invalid authentication data");
+    seen.add(key);
+  }
+  const receivedHash = params.get("hash");
+  const authDateString = params.get("auth_date");
+  const userString = params.get("user");
+  if (
+    !receivedHash ||
+    !/^[a-f0-9]{64}$/i.test(receivedHash) ||
+    !authDateString ||
+    !/^\d+$/.test(authDateString) ||
+    !userString
+  ) {
+    throw new Error("Invalid authentication data");
+  }
+  const authDate = Number(authDateString);
+  const now = Math.floor(Date.now() / 1000);
+  if (
+    !Number.isSafeInteger(authDate) ||
+    authDate > now + 30 ||
+    now - authDate > MAX_AUTH_AGE
+  ) {
+    throw new Error("Expired initData");
+  }
+  const dataCheckString = entries
+    .filter(([key]) => key !== "hash" && key !== "signature")
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n");
+  // Telegram Mini App validation:
+  // secret_key = HMAC_SHA256("WebAppData", bot_token)
+  const secretKey = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode("WebAppData"),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const secret = await crypto.subtle.sign(
+    "HMAC",
+    secretKey,
+    encoder.encode(botToken)
+  );
+  const validationKey = await crypto.subtle.importKey(
+    "raw",
+    secret,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const calculatedHash = bytesToHex(
+    new Uint8Array(
+      await crypto.subtle.sign(
+        "HMAC",
+        validationKey,
+        encoder.encode(dataCheckString)
+      )
+    )
+  );
+  if (!constantTimeEqual(calculatedHash, receivedHash.toLowerCase())) {
+    throw new Error("Invalid authentication data");
+  }
+  let user;
+  try {
+    user = JSON.parse(userString);
+  } catch {
+    throw new Error("Invalid user data");
+  }
+  if (
+    !user ||
+    typeof user !== "object" ||
+    !Number.isSafeInteger(user.id) ||
+    user.id <= 0
+  ) {
+    throw new Error("Invalid user data");
+  }
+  return user;
+}
+function bytesToHex(bytes) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+function constantTimeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let difference = 0;
+  for (let i = 0; i < a.length; i++) {
+    difference |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return difference === 0;
+}
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=UTF-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+    },
+  });
+}
+function corsHeaders(request) {
+  const origin = request.headers.get("origin") || "";
+  const headers = {
+    "access-control-allow-methods": "POST, OPTIONS",
+    "access-control-allow-headers": "Content-Type",
+    "vary": "Origin",
+  };
+  // Same-origin requests do not need CORS. Permit Telegram Web only
+  // when cross-origin access is needed.
+  if (/^https:\/\/web\.telegram\.org$/i.test(origin)) {
+    headers["access-control-allow-origin"] = origin;
+  }
+  return headers;
+}
+function securityHeaders() {
+  return {
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+    "permissions-policy": "camera=(), microphone=(), geolocation=()",
+    "content-security-policy":
+      "default-src 'self'; " +
+      "script-src 'self' 'unsafe-inline' https://telegram.org; " +
+      "style-src 'self' 'unsafe-inline'; " +
+      "img-src 'self' https: data:; " +
+      "connect-src 'self'; " +
+      "base-uri 'none'; form-action 'none';",
+  };
+}
+const HTML = String.raw`<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#090b16">
+  <title>Telegram Profile</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #090b16;
+      --panel: rgba(255,255,255,.055);
+      --border: rgba(255,255,255,.11);
+      --muted: #989bb6;
+      --purple: #9b7bff;
+      --blue: #55c7ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      min-height: 100dvh;
+      padding: 24px 16px calc(24px + env(safe-area-inset-bottom));
+      background:
+        radial-gradient(ellipse at 15% 0%, rgba(110,65,255,.22), transparent 45%),
+        radial-gradient(ellipse at 100% 70%, rgba(40,150,255,.12), transparent 40%),
+        var(--bg);
+      color: #f6f5ff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Tahoma, sans-serif;
+    }
+    .container { width: 100%; max-width: 480px; margin: 0 auto; }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 26px;
+    }
+    .brand { display: flex; align-items: center; gap: 11px; }
+    .logo {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border: 1px solid rgba(255,255,255,.18);
+      border-radius: 15px;
+      background: linear-gradient(135deg, #8968ff, #3a8cff);
+      font-size: 20px;
+      font-weight: 900;
+      box-shadow: 0 6px 30px rgba(113,86,255,.25);
+    }
+    .brand-title { font-weight: 800; letter-spacing: .3px; }
+    .brand-subtitle { color: var(--muted); font-size: 11px; margin-top: 4px; }
+    .status {
+      padding: 7px 10px;
+      border: 1px solid rgba(86,224,166,.22);
+      border-radius: 20px;
+      color: #70e8b0;
+      background: rgba(86,224,166,.07);
+      font-size: 11px;
+    }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: 27px 20px 23px;
+      text-align: center;
+      border: 1px solid var(--border);
+      border-radius: 26px;
+      background: linear-gradient(145deg, rgba(255,255,255,.085), rgba(255,255,255,.025));
+      box-shadow: 0 20px 65px rgba(0,0,0,.22);
+      backdrop-filter: blur(18px);
+    }
+    .hero::before {
+      content: "";
+      position: absolute;
+      width: 180px;
+      height: 180px;
+      top: -120px;
+      left: calc(50% - 90px);
+      border-radius: 50%;
+      background: rgba(133,96,255,.3);
+      filter: blur(45px);
+      pointer-events: none;
+    }
+    .avatar {
+      position: relative;
+      width: 100px;
+      height: 100px;
+      display: grid;
+      place-items: center;
+      margin: 0 auto 16px;
+      border-radius: 32px;
+      border: 2px solid rgba(255,255,255,.2);
+      background: linear-gradient(135deg, #8968ff, #39a7ff);
+      box-shadow: 0 10px 36px rgba(112,91,255,.3);
+      font-size: 36px;
+      font-weight: 800;
+      object-fit: cover;
+    }
+    .name { margin: 0; font-size: 23px; font-weight: 800; overflow-wrap: anywhere; }
+    .username { color: var(--muted); margin-top: 7px; font-size: 13px; direction: ltr; }
+    .badges { display: flex; justify-content: center; flex-wrap: wrap; gap: 8px; margin-top: 17px; }
+    .badge {
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 7px 11px;
+      background: rgba(255,255,255,.04);
+      color: #c7c4e4;
+      font-size: 11px;
+    }
+    .badge.premium {
+      border-color: rgba(255,202,95,.25);
+      color: #ffd77a;
+      background: rgba(255,202,95,.07);
+    }
+    .section-title { margin: 25px 2px 12px; font-size: 13px; font-weight: 700; color: #c8c5e5; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .item {
+      min-width: 0;
+      padding: 15px 14px;
+      border: 1px solid var(--border);
+      border-radius: 17px;
+      background: var(--panel);
+    }
+    .label { color: var(--muted); font-size: 11px; margin-bottom: 10px; }
+    .value { font-size: 14px; font-weight: 700; overflow-wrap: anywhere; direction: ltr; text-align: right; }
+    .wide { grid-column: 1 / -1; }
+    button {
+      width: 100%;
+      margin-top: 18px;
+      padding: 15px;
+      border: 0;
+      border-radius: 15px;
+      color: white;
+      background: linear-gradient(100deg, #795cff, #438eff);
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
+      box-shadow: 0 8px 26px rgba(95,91,255,.2);
+    }
+    button:active { transform: scale(.99); }
+    button:disabled { opacity: .5; cursor: default; }
+    .message {
+      margin-top: 14px;
+      padding: 13px;
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      background: rgba(255,255,255,.04);
+      color: #b8b8d2;
+      text-align: center;
+      font-size: 12px;
+      line-height: 1.8;
+      overflow-wrap: anywhere;
+    }
+    .message.error { color: #ff9fba; border-color: rgba(255,90,130,.22); }
+    .footer { text-align: center; color: #696b87; font-size: 10px; margin-top: 24px; }
+    .hidden { display: none !important; }
+    .loading { opacity: .7; }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <header class="header">
+      <div class="brand">
+        <div class="logo">B</div>
+        <div>
+          <div class="brand-title">BEGAIL</div>
+          <div class="brand-subtitle">TELEGRAM MINI APP</div>
+        </div>
+      </div>
+      <div class="status">● Secure session</div>
+    </header>
+    <section class="hero">
+      <img id="avatar" class="avatar hidden" alt="Profile photo" referrerpolicy="no-referrer">
+      <div id="avatarFallback" class="avatar">?</div>
+      <h1 id="name" class="name">در حال اتصال...</h1>
+      <div id="username" class="username">@telegram</div>
+      <div class="badges">
+        <span id="premiumBadge" class="badge premium hidden">✦ Telegram Premium</span>
+        <span id="verifiedBadge" class="badge">✓ تأیید اطلاعات از تلگرام</span>
+      </div>
+    </section>
+    <div class="section-title">اطلاعات حساب</div>
+    <section class="grid">
+      <div class="item">
+        <div class="label">Telegram User ID</div>
+        <div id="userId" class="value">—</div>
+      </div>
+      <div class="item">
+        <div class="label">Language</div>
+        <div id="language" class="value">—</div>
+      </div>
+      <div class="item">
+        <div class="label">Account Type</div>
+        <div id="accountType" class="value">—</div>
+      </div>
+      <div class="item">
+        <div class="label">Telegram Platform</div>
+        <div id="platform" class="value">—</div>
+      </div>
+      <div class="item wide">
+        <div class="label">Mini App Version</div>
+        <div id="version" class="value">—</div>
+      </div>
+    </section>
+    <button id="copyButton" disabled>کپی کردن شناسه کاربری</button>
+    <div id="message" class="message">در حال بررسی نشست امن تلگرام...</div>
+    <div class="footer">BEGAIL DEVELOPMENT · Telegram Web Apps</div>
+  </main>
+  <script>
+    (() => {
+      "use strict";
+      const $ = (id) => document.getElementById(id);
+      const tg = window.Telegram && window.Telegram.WebApp;
+      let currentUserId = null;
+      if (tg) {
+        try {
+          tg.ready();
+          tg.expand();
+          if (tg.setHeaderColor) tg.setHeaderColor("#090b16");
+          if (tg.setBackgroundColor) tg.setBackgroundColor("#090b16");
+        } catch (_) {}
+      }
+      $("platform").textContent = tg && tg.platform ? tg.platform : "Browser";
+      $("version").textContent = tg && tg.version ? tg.version : "Unavailable";
+      function showMessage(text, isError = false) {
+        $("message").textContent = text;
+        $("message").classList.toggle("error", isError);
+      }
+      function showUser(user) {
+        currentUserId = user.id;
+        const fullName = user.full_name || "Telegram User";
+        $("name").textContent = fullName;
+        $("username").textContent = user.username
+          ? "@" + user.username
+          : "نام کاربری تنظیم نشده";
+        $("userId").textContent = String(user.id);
+        $("language").textContent = user.language_code || "نامشخص";
+        $("accountType").textContent = user.is_premium ? "Premium" : "Standard";
+        if (user.is_premium) $("premiumBadge").classList.remove("hidden");
+        if (user.photo_url) {
+          $("avatar").src = user.photo_url;
+          $("avatar").classList.remove("hidden");
+          $("avatarFallback").classList.add("hidden");
+          $("avatar").onerror = () => {
+            $("avatar").classList.add("hidden");
+            $("avatarFallback").classList.remove("hidden");
+          };
+        } else {
+          $("avatarFallback").textContent =
+            Array.from(fullName)[0] || "?";
+        }
+        $("copyButton").disabled = false;
+        showMessage("اطلاعات حساب با موفقیت تأیید شد.");
+      }
+      async function authenticate() {
+        if (!tg || !tg.initData) {
+          $("name").textContent = "Mini App باز نشده";
+          $("username").textContent = "Telegram initData در دسترس نیست";
+          showMessage(
+            "این صفحه را از دکمه Web App داخل ربات تلگرام باز کن؛ باز کردن مستقیم لینک در مرورگر کافی نیست.",
+            true
+          );
+          return;
+        }
+        $("message").classList.add("loading");
+        try {
+          const response = await fetch("/api/auth", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            cache: "no-store",
+            body: JSON.stringify({ initData: tg.initData }),
+          });
+          const result = await response.json();
+          if (!response.ok || !result.ok || !result.user) {
+            throw new Error(result.error || "احراز هویت ناموفق بود.");
+          }
+          showUser(result.user);
+        } catch (error) {
+          $("name").textContent = "اتصال ناموفق";
+          $("username").textContent = "اطلاعات حساب دریافت نشد";
+          showMessage(error.message || "خطای ناشناخته", true);
+        } finally {
+          $("message").classList.remove("loading");
+        }
+      }
+      $("copyButton").addEventListener("click", async () => {
+        if (!currentUserId) return;
+        try {
+          await navigator.clipboard.writeText(String(currentUserId));
+          $("copyButton").textContent = "✓ شناسه کپی شد";
+          if (tg && tg.HapticFeedback) {
+            tg.HapticFeedback.notificationOccurred("success");
+          }
+          setTimeout(() => {
+            $("copyButton").textContent = "کپی کردن شناسه کاربری";
+          }, 1800);
+        } catch (_) {
+          showMessage("کپی خودکار انجام نشد؛ شناسه را دستی کپی کن.", true);
+        }
+      });
+      authenticate();
+    })();
+  </script>
+</body>
+</html>`;
