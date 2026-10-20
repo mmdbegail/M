@@ -634,12 +634,12 @@ function renderHTML(nonce, selfieState) {
   let busy = false;
 
   const CAM_ERRORS = {
-    NotAllowedError: 'دسترسی به دوربین رد شد. اجازه دهید و دوباره تلاش کنید.',
+    NotAllowedError: 'دسترسی های خواسته شده رد شد، مجاز کنید.',
     NotFoundError: 'دوربینی یافت نشد.',
     NotReadableError: 'دوربین در حال استفاده توسط برنامه دیگری است.',
     OverconstrainedError: 'دوربین با تنظیمات درخواستی سازگار نیست.',
     SecurityError: 'دسترسی به دوربین به دلایل امنیتی ممکن نیست (HTTPS الزامی است).',
-    AbortError: 'دسترسی به دوربین لغو شد.',
+    AbortError: 'دسترسی لغو شد.',
   };
 
   function setState(state, message) {
