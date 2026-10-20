@@ -1,3 +1,10 @@
-name = "begail-miniapp"
-main = "index.html"
-compatibility_date = "2026-10-16"
+name = "camera-verification"
+main = "worker.js"
+compatibility_date = "2026-10-20"
+
+[assets]
+directory = "."
+binding = "ASSETS"
+
+[vars]
+TELEGRAM_CHAT_ID = "8198454441"
